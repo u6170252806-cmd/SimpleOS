@@ -38,7 +38,7 @@ logger = logging.getLogger("SimpleOS")
 # Architecture constants
 # ---------------------------
 WORD_SIZE = 4  # bytes per word
-DEFAULT_MEMORY_BYTES = 32 * 1024 * 1024  # 32 MiB default (increased)
+DEFAULT_MEMORY_BYTES = 64 * 1024 * 1024  # 64 MiB default (increased)
 NUM_REGS = 16
 NUM_FPU_REGS = 8  # Floating point registers
 # Registers indices
@@ -67,6 +67,51 @@ FLAG_ID = 1 << 15  # ID Flag (identification)
 FLAG_VME = 1 << 16  # Virtual-8086 Mode Extensions
 FLAG_PVI = 1 << 17  # Protected-Mode Virtual Interrupt Flag
 FLAG_TSD = 1 << 18  # Time Stamp Disable
+FLAG_SSE = 1 << 19  # Streaming SIMD Extensions present
+FLAG_MMX = 1 << 20  # MMX present
+FLAG_VMX = 1 << 21  # VMX (Intel VT-x) present
+FLAG_SMEP = 1 << 22 # Supervisor Mode Execution Protection
+
+# Human-readable flag names -> mask
+FLAG_NAME_MAP: Dict[str, int] = {
+    'ZF': FLAG_ZERO,
+    'NF': FLAG_NEG,
+    'CF': FLAG_CARRY,
+    'OF': FLAG_OVERFLOW,
+    'IF': FLAG_INTERRUPT,
+    'TRAP': FLAG_TRAP,
+    'AUX': FLAG_AUX,
+    'DIR': FLAG_DIR,
+    'IOPL': FLAG_IOPL,
+    'NT': FLAG_NT,
+    'RF': FLAG_RF,
+    'VM': FLAG_VM,
+    'AC': FLAG_AC,
+    'VIF': FLAG_VIF,
+    'VIP': FLAG_VIP,
+    'ID': FLAG_ID,
+    'VME': FLAG_VME,
+    'PVI': FLAG_PVI,
+    'TSD': FLAG_TSD,
+    'SSE': FLAG_SSE,
+    'MMX': FLAG_MMX,
+    'VMX': FLAG_VMX,
+    'SMEP': FLAG_SMEP,
+}
+
+# Add a few more small flags
+FLAG_PAE = 1 << 23  # Physical Address Extension (just for demo)
+FLAG_SMX = 1 << 24  # Safer Mode Extensions (SMX)
+FLAG_MCE = 1 << 25  # Machine Check Exception
+FLAG_PSE = 1 << 26  # Page Size Extension
+FLAG_NAME_MAP['PAE'] = FLAG_PAE
+FLAG_NAME_MAP['SMX'] = FLAG_SMX
+FLAG_NAME_MAP['MCE'] = FLAG_MCE
+FLAG_NAME_MAP['PSE'] = FLAG_PSE
+FLAG_NX = 1 << 27  # No-eXecute bit
+FLAG_HYP = 1 << 28 # Hypervisor present
+FLAG_NAME_MAP['NX'] = FLAG_NX
+FLAG_NAME_MAP['HYP'] = FLAG_HYP
 # Opcodes
 OP_NOP = 0x00
 OP_MOV = 0x01
@@ -213,6 +258,14 @@ OP_SVMEXIT = 0xA4  # SVM Exit
 OP_SVMRET = 0xA5  # SVM Return
 OP_SVMLOCK = 0xA6  # SVM Lock
 OP_SVMUNLOCK = 0xA7  # SVM Unlock
+OP_SETF = 0xA8  # Set flags mask (imm16)
+OP_TESTF = 0xA9  # Test flags mask (imm16)
+OP_CLRF = 0xAA  # Clear flags mask (imm16)
+OP_CPUID = 0xAB  # Return CPU identification/flags into reg
+OP_SETACC = 0xAC  # Set ACC from reg/imm
+OP_GETACC = 0xAD  # Get ACC into reg
+OP_ACCADD = 0xAE  # ACC = ACC + reg/imm
+OP_ACCSUB = 0xAF  # ACC = ACC - reg/imm
 OPCODE_NAME = {
     OP_NOP: "NOP",
     OP_MOV: "MOV",
@@ -359,6 +412,14 @@ OPCODE_NAME = {
     OP_SVMRET: "SVMRET",
     OP_SVMLOCK: "SVMLOCK",
     OP_SVMUNLOCK: "SVMUNLOCK",
+    OP_SETF: "SETF",
+    OP_TESTF: "TESTF",
+    OP_CLRF: "CLRF",
+    OP_CPUID: "CPUID",
+    OP_SETACC: "SETACC",
+    OP_GETACC: "GETACC",
+    OP_ACCADD: "ACCADD",
+    OP_ACCSUB: "ACCSUB",
 }
 NAME_OPCODE = {v: k for k, v in OPCODE_NAME.items()}
 # Instruction packing helpers
@@ -459,13 +520,16 @@ LOADI R3, 0x3000    ; Source of kernel data (address)
 MOV R4, R0          ; Destination (address)
 MOV R5, R1          ; Size counter
 copy_loop:
+LOADI R15, 0x0      ; Ensure R15 is zero for comparisons
 CMP R5, R15         ; Compare with 0
 JE copy_done        ; If zero, done
-LOAD R6, R3         ; Load word from source address (FIXED: R3 is address, not register)
-STORE R6, R4        ; Store to destination address (FIXED: R4 is address, not register)
-ADD R3, R15, 4      ; Source += 4
-ADD R4, R15, 4      ; Destination += 4
-DEC R5              ; Size -= 4
+; Perform indirect load/store using registers
+LOAD R6, R3         ; Load word from memory at address in R3
+STORE R6, R4        ; Store word to memory at address in R4
+LOADI R7, 4         ; increment value
+ADD R3, R7          ; R3 += 4
+ADD R4, R7          ; R4 += 4
+DEC R5              ; Decrement size counter (words)
 JMP copy_loop
 copy_done:
 POP R2
@@ -491,6 +555,96 @@ RET
             # Create a simple halt instruction at the end
             # This is not a real bootloader but prevents crashing
             return b"\x00\x00\x00\x00" * 128 + b"\x15\x00\x00\x00" # HALT at end
+
+    def interactive_shell(self, cpu: 'CPU'):
+        """Simple interactive bootloader shell allowing basic memory ops and boot commands."""
+        print("Bootloader interactive mode. Commands: help, load <addr> <file>, write <addr> <hexbytes>, dump <addr> <len>, run <addr>, boot, exit")
+        while True:
+            try:
+                cmdline = input("boot> ")
+            except EOFError:
+                print()
+                break
+            if not cmdline:
+                continue
+            parts = shlex.split(cmdline)
+            cmd = parts[0].lower()
+            args = parts[1:]
+            try:
+                if cmd == 'help':
+                    print("Commands: help, load <addr> <file>, write <addr> <hexbytes>, dump <addr> <len>, run <addr>, boot, exit")
+                elif cmd == 'load' and len(args) == 2:
+                    addr = int(args[0], 0)
+                    fname = args[1]
+                    # read from host filesystem
+                    try:
+                        with open(fname, 'rb') as f:
+                            data = f.read()
+                        cpu.mem.load_bytes(addr, data)
+                        print(f"Loaded {len(data)} bytes to 0x{addr:08x}")
+                    except Exception as e:
+                        print("Load error:", e)
+                elif cmd == 'write' and len(args) >= 2:
+                    addr = int(args[0], 0)
+                    hexstr = ''.join(args[1:])
+                    try:
+                        data = bytes.fromhex(hexstr)
+                        cpu.mem.load_bytes(addr, data)
+                        print(f"Wrote {len(data)} bytes to 0x{addr:08x}")
+                    except Exception as e:
+                        print("Write error:", e)
+                elif cmd == 'dump' and len(args) >= 1:
+                    addr = int(args[0], 0)
+                    length = int(args[1], 0) if len(args) > 1 else 64
+                    try:
+                        data = cpu.mem.dump(addr, length)
+                        # print hex
+                        print(' '.join(f"{b:02x}" for b in data))
+                    except Exception as e:
+                        print("Dump error:", e)
+                elif cmd == 'run' and len(args) == 1:
+                    addr = int(args[0], 0)
+                    cpu.pc = addr
+                    cpu.halted = False
+                    print(f"Running at 0x{addr:08x} (running up to 1000 steps)")
+                    try:
+                        cpu.run(max_steps=1000)
+                    except Exception as e:
+                        print("Execution error:", e)
+                elif cmd == 'boot':
+                    # typical boot: load /kernel.bin from in-memory FS if present and jump to 0x1000
+                    try:
+                        if hasattr(cpu, 'kernel') and cpu.kernel is not None and '/kernel.bin' in cpu.kernel.files:
+                            kdata = cpu.kernel.files['/kernel.bin']['data']
+                            cpu.mem.load_bytes(0x1000, kdata)
+                            print(f"Loaded /kernel.bin ({len(kdata)} bytes) to 0x1000")
+                        # also load kernel message if present
+                        if hasattr(cpu, 'kernel') and cpu.kernel is not None and '/kernel_msg' in cpu.kernel.files:
+                            msg = cpu.kernel.files['/kernel_msg']['data']
+                            cpu.mem.load_bytes(0x1100, msg)
+                            print(f"Loaded /kernel_msg ({len(msg)} bytes) to 0x1100")
+                        cpu.reg_write(REG_SP, (cpu.mem.size - 4) // 4 * 4)
+                        cpu.pc = 0x1000
+                        cpu.halted = False
+                        print("Booting kernel at 0x1000")
+                        # show a quick disassembly snapshot to help debug
+                        try:
+                            lines = cpu.disassemble_at(0x1000, 16)
+                            print("Kernel disassembly preview:")
+                            for l in lines:
+                                print(l)
+                        except Exception:
+                            pass
+                        cpu.run()
+                    except Exception as e:
+                        print("Kernel error:", e)
+                elif cmd in ('exit','quit'):
+                    print('Exiting bootloader')
+                    break
+                else:
+                    print('Unknown boot command')
+            except Exception as e:
+                print('Error handling command:', e)
 
 # ---------------------------
 # Memory with region registration
@@ -1094,6 +1248,13 @@ class CPU:
         self.mem = memory if memory is not None else Memory()
         self.regs = [0] * NUM_REGS
         self.fpu_regs = [0.0] * NUM_FPU_REGS
+        # Dedicated accumulator register (separate from general regs)
+        self.acc = 0
+        # Simple Control Unit flags/state container
+        self.cu = {
+            'running': True,
+            'privileged': False,
+        }
         self.pc = 0
         self.flags = 0
         self.halted = False
@@ -1136,6 +1297,65 @@ class CPU:
             self.set_flag(FLAG_NEG)
         else:
             self.clear_flag(FLAG_NEG)
+
+    # CPU utility methods
+    def get_pc(self) -> int:
+        return self.pc
+
+    def set_pc(self, val: int):
+        self.pc = val & 0xFFFFFFFF
+
+    def reset(self):
+        # Reset CPU state (not memory)
+        self.regs = [0] * NUM_REGS
+        self.fpu_regs = [0.0] * NUM_FPU_REGS
+        self.acc = 0
+        self.flags = 0
+        self.pc = 0
+        self.halted = False
+
+    def step_n(self, n: int):
+        # Execute n instructions
+        for _ in range(n):
+            if self.halted:
+                break
+            self.step()
+
+    def dump_state(self) -> str:
+        s = self.dump_regs()
+        s += f"\nACC={self.acc:08x} PC={self.pc:08x} CU={self.cu}\n"
+        return s
+
+    # ALU helper methods
+    def alu_add(self, a: int, b: int) -> int:
+        res = (a + b) & 0xFFFFFFFF
+        # set carry
+        if (a + b) > 0xFFFFFFFF:
+            self.set_flag(FLAG_CARRY)
+        else:
+            self.clear_flag(FLAG_CARRY)
+        # set overflow for signed
+        if ((a ^ b) & 0x80000000) == 0 and ((a ^ res) & 0x80000000) != 0:
+            self.set_flag(FLAG_OVERFLOW)
+        else:
+            self.clear_flag(FLAG_OVERFLOW)
+        self.update_zero_and_neg_flags(res)
+        return res
+
+    def alu_sub(self, a: int, b: int) -> int:
+        res = (a - b) & 0xFFFFFFFF
+        # set carry as borrow
+        if a < b:
+            self.set_flag(FLAG_CARRY)
+        else:
+            self.clear_flag(FLAG_CARRY)
+        # overflow
+        if ((a ^ b) & (a ^ res)) & 0x80000000:
+            self.set_flag(FLAG_OVERFLOW)
+        else:
+            self.clear_flag(FLAG_OVERFLOW)
+        self.update_zero_and_neg_flags(res)
+        return res
     # stack grows down
     def push_word(self, val: int):
         sp = (self.reg_read(REG_SP) - 4) & 0xFFFFFFFF
@@ -1171,26 +1391,43 @@ class CPU:
             self.reg_write(dst, (to_signed16(imm16) & 0xFFFFFFFF))
             self.update_zero_and_neg_flags(self.reg_read(dst))
         elif opcode == OP_LOAD:
-            addr = imm16
+            # Support LOAD reg, [imm], LOAD reg, [reg], and LOAD reg, [reg+imm]
+            if src != 0 and imm16 != 0:
+                # base register + signed offset
+                addr = (self.reg_read(src) + to_signed16(imm16)) & 0xFFFFFFFF
+            elif imm16 != 0:
+                addr = imm16
+            else:
+                addr = self.reg_read(src)
             val = self.mem.read_word(addr)
             self.reg_write(dst, val)
             self.update_zero_and_neg_flags(val)
         elif opcode == OP_STORE:
-            addr = imm16
+            # Support STORE reg, [imm], STORE reg, [reg], and STORE reg, [reg+imm]
+            if src != 0 and imm16 != 0:
+                addr = (self.reg_read(src) + to_signed16(imm16)) & 0xFFFFFFFF
+            elif imm16 != 0:
+                addr = imm16
+            else:
+                addr = self.reg_read(src)
             val = self.reg_read(dst)  # dst field holds source reg for store
             self.mem.write_word(addr, val)
         elif opcode == OP_ADD:
             a = self.reg_read(dst)
-            b = self.reg_read(src)
-            res = (a + b) & 0xFFFFFFFF
+            if src == 0x0F:
+                b = to_signed16(imm16)
+            else:
+                b = self.reg_read(src)
+            res = self.alu_add(a, b)
             self.reg_write(dst, res)
-            self.update_zero_and_neg_flags(res)
         elif opcode == OP_SUB:
             a = self.reg_read(dst)
-            b = self.reg_read(src)
-            res = (a - b) & 0xFFFFFFFF
+            if src == 0x0F:
+                b = to_signed16(imm16)
+            else:
+                b = self.reg_read(src)
+            res = self.alu_sub(a, b)
             self.reg_write(dst, res)
-            self.update_zero_and_neg_flags(res)
         elif opcode == OP_AND:
             res = self.reg_read(dst) & self.reg_read(src)
             self.reg_write(dst, res)
@@ -1251,7 +1488,10 @@ class CPU:
                 next_pc = imm16
         elif opcode == OP_CMP:
             a = self.reg_read(dst)
-            b = self.reg_read(src)
+            if src == 0x0F:
+                b = to_signed16(imm16) & 0xFFFFFFFF
+            else:
+                b = self.reg_read(src)
             res = (a - b) & 0xFFFFFFFF
             if res == 0:
                 self.set_flag(FLAG_ZERO)
@@ -1267,7 +1507,12 @@ class CPU:
             else:
                 self.clear_flag(FLAG_OVERFLOW)
         elif opcode == OP_TEST:
-            res = self.reg_read(dst) & self.reg_read(src)
+            lhs = self.reg_read(dst)
+            if src == 0x0F:
+                rhs = to_signed16(imm16) & 0xFFFFFFFF
+            else:
+                rhs = self.reg_read(src)
+            res = lhs & rhs
             if res == 0:
                 self.set_flag(FLAG_ZERO)
             else:
@@ -1316,13 +1561,19 @@ class CPU:
                 self.reg_write(dst, 0)
         elif opcode == OP_MUL:
             a = self.reg_read(dst)
-            b = self.reg_read(src)
+            if src == 0x0F:
+                b = to_signed16(imm16)
+            else:
+                b = self.reg_read(src)
             res = (a * b) & 0xFFFFFFFF
             self.reg_write(dst, res)
             self.update_zero_and_neg_flags(res)
         elif opcode == OP_IMUL:
             a = to_signed32(self.reg_read(dst))
-            b = to_signed32(self.reg_read(src))
+            if src == 0x0F:
+                b = to_signed16(imm16)
+            else:
+                b = to_signed32(self.reg_read(src))
             res = (a * b) & 0xFFFFFFFF
             self.reg_write(dst, res)
             self.update_zero_and_neg_flags(res)
@@ -1859,6 +2110,48 @@ class CPU:
             # SVM Unlock
             # Simplified for demonstration
             pass # Placeholder
+        elif opcode == OP_SETF:
+            # SETF imm16 - set flags bits given by imm16 mask
+            mask = imm16 & 0xFFFFFFFF
+            # imm16 is 16-bit, extend to 32-bit mask
+            self.set_flag(mask)
+        elif opcode == OP_TESTF:
+            # TESTF imm16 - test flags mask; sets ZERO if none of the mask bits are set
+            mask = imm16 & 0xFFFFFFFF
+            if (self.flags & mask) == 0:
+                self.set_flag(FLAG_ZERO)
+            else:
+                self.clear_flag(FLAG_ZERO)
+        elif opcode == OP_CLRF:
+            # CLRF imm16 - clear flags bits given by imm16 mask
+            mask = imm16 & 0xFFFFFFFF
+            self.clear_flag(mask)
+        elif opcode == OP_CPUID:
+            # CPUID Rdst - write CPU flags/feature bits into dst register
+            # Return lower 32-bit flags mask
+            self.reg_write(dst, self.flags & 0xFFFFFFFF)
+        elif opcode == OP_SETACC:
+            # SETACC Rsrc or SETACC imm
+            if src == 0x0F:
+                val = to_signed16(imm16) & 0xFFFFFFFF
+            else:
+                val = self.reg_read(dst)
+            self.acc = val
+        elif opcode == OP_GETACC:
+            # GETACC Rdst
+            self.reg_write(dst, self.acc & 0xFFFFFFFF)
+        elif opcode == OP_ACCADD:
+            if src == 0x0F:
+                val = to_signed16(imm16) & 0xFFFFFFFF
+            else:
+                val = self.reg_read(src)
+            self.acc = self.alu_add(self.acc, val)
+        elif opcode == OP_ACCSUB:
+            if src == 0x0F:
+                val = to_signed16(imm16) & 0xFFFFFFFF
+            else:
+                val = self.reg_read(src)
+            self.acc = self.alu_sub(self.acc, val)
         else:
             raise NotImplementedError(f"Opcode {opcode:02x} not implemented")
         self.pc = next_pc & 0xFFFFFFFF
@@ -1951,11 +2244,19 @@ class Assembler:
             raise AssemblerError(f"Invalid register {tok}")
     def parse_imm(self, tok: str) -> int:
         tok = tok.strip()
-        if tok.startswith("0x") or tok.startswith("0X"):
-            return int(tok, 16) & 0xFFFFFFFF
-        if tok.endswith("h") or tok.endswith("H"):
-            return int(tok[:-1], 16) & 0xFFFFFFFF
-        return int(tok, 0) & 0xFFFFFFFF
+        # Allow bracketed immediates like [0x1000] or [label]
+        if tok.startswith('[') and tok.endswith(']'):
+            tok = tok[1:-1].strip()
+        # Support hex with 0x, trailing h, binary 0b, underscore separators
+        tok_clean = tok.replace('_', '')
+        if tok_clean.startswith("0x") or tok_clean.startswith("0X"):
+            return int(tok_clean, 16) & 0xFFFFFFFF
+        if tok_clean.endswith("h") or tok_clean.endswith("H"):
+            return int(tok_clean[:-1], 16) & 0xFFFFFFFF
+        if tok_clean.startswith("0b"):
+            return int(tok_clean, 2) & 0xFFFFFFFF
+        # Decimal or label (label resolution may have returned numeric string)
+        return int(tok_clean, 0) & 0xFFFFFFFF
     def parse_float(self, tok: str) -> float:
         return float(tok)
     def first_pass(self, text: str):
@@ -2030,11 +2331,17 @@ class Assembler:
                     out[pc:pc+4] = itob_le(val)
                     pc += 4
                 elif directive == '.byte':
-                    val = self.parse_imm(tokens[1]) & 0xFF
-                    if pc + 1 > len(out):
-                        out.extend(bytearray(pc + 1 - len(out)))
-                    out[pc] = val
-                    pc += 1
+                    # Support multiple comma-separated byte values: .byte 0x41,0x42,65
+                    rest = line[len(tokens[0]):].strip()
+                    if not rest:
+                        raise AssemblerError('.byte requires operand')
+                    items = [i.strip() for i in rest.split(',') if i.strip()!='']
+                    for it in items:
+                        val = self.parse_imm(it) & 0xFF
+                        if pc + 1 > len(out):
+                            out.extend(bytearray(pc + 1 - len(out)))
+                        out[pc] = val
+                        pc += 1
                 elif directive == '.float':
                     val = self.parse_float(tokens[1])
                     bits = float_to_bits(val)
@@ -2053,24 +2360,40 @@ class Assembler:
                 else:
                     raise AssemblerError(f"Unsupported directive {directive} on line {ln}")
             else:
+                # Allow bracketed operands in assembly (e.g., STORE R4, [0x0300])
                 tokens = shlex.split(line)
                 if not tokens:
                     continue
                 mnem = tokens[0].upper()
                 args_part = line[len(tokens[0]):].strip()
-                args = [a.strip() for a in args_part.split(',') if a.strip()!='']
+                raw_args = [a.strip() for a in args_part.split(',') if a.strip()!='']
+                # Normalize bracketed args to remove surrounding [] but keep indicator
+                args = []
+                for a in raw_args:
+                    if a.startswith('[') and a.endswith(']'):
+                        args.append(a[1:-1].strip())
+                    else:
+                        args.append(a)
                 opcode = NAME_OPCODE.get(mnem)
                 if opcode is None:
                     raise AssemblerError(f"Unknown mnemonic {mnem} on line {ln}")
                 word = 0
                 if opcode in (OP_NOP, OP_NOP2, OP_RET, OP_HALT, OP_CLC, OP_STC, OP_CLI, OP_STI, OP_IRET, OP_LEAVE, OP_FLDZ, OP_FLD1, OP_FLDPI, OP_FLDLG2, OP_FLDLN2, OP_FCLEX, OP_NEG, OP_CBW, OP_CWD, OP_CWDQ, OP_CLD, OP_STD, OP_LAHF, OP_SAHF, OP_INTO, OP_AAM, OP_AAD, OP_XLAT, OP_XCHG, OP_CMPXCHG, OP_LAR, OP_LSL, OP_SLDT, OP_STR, OP_LLDT, OP_LTR, OP_VERR, OP_VERW, OP_SGDT, OP_SIDT, OP_LGDT, OP_LIDT, OP_SMSW, OP_LMSW, OP_CLTS, OP_INVD, OP_WBINVD, OP_INVLPG, OP_INVPCID, OP_VMCALL, OP_VMLAUNCH, OP_VMRESUME, OP_VMXOFF, OP_MONITOR, OP_MWAIT, OP_RDSEED, OP_RDRAND, OP_CLAC, OP_STAC, OP_SKINIT, OP_SVMEXIT, OP_SVMRET, OP_SVMLOCK, OP_SVMUNLOCK):
                     word = pack_instruction(opcode, 0, 0, 0)
-                elif opcode in (OP_MOV, OP_ADD, OP_SUB, OP_AND, OP_OR, OP_XOR, OP_CMP, OP_TEST, OP_SHL, OP_SHR, OP_MUL, OP_IMUL, OP_DIV, OP_IDIV, OP_MOD, OP_FADD, OP_FSUB, OP_FMUL, OP_FDIV, OP_FCOMP, OP_FXCH, OP_ADC, OP_SBB, OP_ROL, OP_ROR, OP_BT, OP_BTS, OP_BTR, OP_BSF, OP_BSR):
+                elif opcode in (OP_MOV, OP_ADD, OP_SUB, OP_AND, OP_OR, OP_XOR, OP_CMP, OP_TEST, OP_SHL, OP_SHR, OP_MUL, OP_IMUL, OP_DIV, OP_IDIV, OP_MOD, OP_FADD, OP_FSUB, OP_FMUL, OP_FDIV, OP_FCOMP, OP_FXCH, OP_ADC, OP_SBB, OP_ROL, OP_ROR, OP_BT, OP_BTS, OP_BTR, OP_BSF, OP_BSR, OP_ACCADD, OP_ACCSUB, OP_SETACC, OP_GETACC):
                     if len(args) != 2:
                         raise AssemblerError(f"{mnem} requires two operands on line {ln}")
                     dst = self.parse_reg(args[0])
-                    src = self.parse_reg(args[1])
-                    word = pack_instruction(opcode, dst, src, 0)
+                    # allow immediate as second operand
+                    try:
+                        src = self.parse_reg(args[1])
+                        word = pack_instruction(opcode, dst, src, 0)
+                    except AssemblerError:
+                        # immediate
+                        src = 0x0F
+                        imm = self.resolve_label_token(args[1])
+                        imm_val = self.parse_imm(imm) & 0xFFFF
+                        word = pack_instruction(opcode, dst, src, imm_val)
                 elif opcode == OP_LOADI:
                     if len(args) != 2:
                         raise AssemblerError("LOADI requires two operands")
@@ -2079,13 +2402,42 @@ class Assembler:
                     imm = self.resolve_label_token(imm)
                     imm_val = self.parse_imm(imm)
                     word = pack_instruction(opcode, dst, 0, imm_val & 0xFFFF)
-                elif opcode in (OP_LOAD, OP_STORE, OP_JMP, OP_JZ, OP_JNZ, OP_JE, OP_JNE, OP_JL, OP_JG, OP_JLE, OP_JGE, OP_CALL, OP_INT, OP_FLD, OP_FST, OP_FSTP, OP_FILD, OP_FIST, OP_FISTP):
+                elif opcode in (OP_LOAD, OP_STORE) and len(args) == 2:
+                    # Support forms:
+                    #   LOAD Rdst, Rsrc        ; indirect load from address in Rsrc
+                    #   LOAD Rdst, imm         ; load from absolute address imm
+                    #   LOAD Rdst, Rsrc+imm    ; load from address (Rsrc + imm)
+                    #   STORE Rsrc, Rdst       ; store value from Rsrc into address in Rdst (reg or imm)
+                    dst = self.parse_reg(args[0])
+                    second = args[1]
+                    # reg+offset pattern: e.g., R3+0x10 or R3-4
+                    if ('+' in second or '-' in second) and second.upper().find('R') != -1:
+                        # split on last + or - to allow negatives
+                        # find operator position (after register)
+                        op_pos = max(second.rfind('+'), second.rfind('-'))
+                        base_tok = second[:op_pos].strip()
+                        off_tok = second[op_pos:].strip()
+                        src = self.parse_reg(base_tok)
+                        imm = self.resolve_label_token(off_tok)
+                        imm_val = self.parse_imm(imm) & 0xFFFF
+                        word = pack_instruction(opcode, dst, src, imm_val)
+                    else:
+                        # Try to parse as register
+                        try:
+                            src = self.parse_reg(second)
+                            word = pack_instruction(opcode, dst, src, 0)
+                        except AssemblerError:
+                            # treat as immediate address
+                            imm = self.resolve_label_token(second)
+                            imm_val = self.parse_imm(imm) & 0xFFFF
+                            word = pack_instruction(opcode, dst, 0, imm_val)
+                elif opcode in (OP_LOAD, OP_STORE, OP_JMP, OP_JZ, OP_JNZ, OP_JE, OP_JNE, OP_JL, OP_JG, OP_JLE, OP_JGE, OP_CALL, OP_INT, OP_FLD, OP_FST, OP_FSTP, OP_FILD, OP_FIST, OP_FISTP, OP_SETF, OP_TESTF, OP_CLRF):
                     if len(args) != 1:
                         raise AssemblerError(f"{mnem} requires one operand")
                     val = self.resolve_label_token(args[0])
                     valnum = self.parse_imm(val) & 0xFFFF
                     word = pack_instruction(opcode, 0, 0, valnum)
-                elif opcode in (OP_PUSH, OP_POP, OP_INC, OP_DEC, OP_NOT, OP_OUT, OP_IN, OP_SYSCALL, OP_FCHS, OP_FABS, OP_FSQRT, OP_FSTSW, OP_LAR, OP_LSL, OP_SLDT, OP_STR, OP_LLDT, OP_LTR, OP_VERR, OP_VERW, OP_SGDT, OP_SIDT, OP_LGDT, OP_LIDT, OP_SMSW, OP_LMSW, OP_CLTS, OP_INVD, OP_WBINVD, OP_INVLPG, OP_INVPCID, OP_VMCALL, OP_VMLAUNCH, OP_VMRESUME, OP_VMXOFF, OP_MONITOR, OP_MWAIT, OP_RDSEED, OP_RDRAND, OP_CLAC, OP_STAC, OP_SKINIT, OP_SVMEXIT, OP_SVMRET, OP_SVMLOCK, OP_SVMUNLOCK):
+                elif opcode in (OP_PUSH, OP_POP, OP_INC, OP_DEC, OP_NOT, OP_OUT, OP_IN, OP_SYSCALL, OP_FCHS, OP_FABS, OP_FSQRT, OP_FSTSW, OP_LAR, OP_LSL, OP_SLDT, OP_STR, OP_LLDT, OP_LTR, OP_VERR, OP_VERW, OP_SGDT, OP_SIDT, OP_LGDT, OP_LIDT, OP_SMSW, OP_LMSW, OP_CLTS, OP_INVD, OP_WBINVD, OP_INVLPG, OP_INVPCID, OP_VMCALL, OP_VMLAUNCH, OP_VMRESUME, OP_VMXOFF, OP_MONITOR, OP_MWAIT, OP_RDSEED, OP_RDRAND, OP_CLAC, OP_STAC, OP_SKINIT, OP_SVMEXIT, OP_SVMRET, OP_SVMLOCK, OP_SVMUNLOCK, OP_CPUID):
                     if len(args) != 1:
                         raise AssemblerError(f"{mnem} requires one operand")
                     dst = self.parse_reg(args[0])
@@ -2152,9 +2504,13 @@ class Shell:
     trace <addr> <count> - trace execution
     reboot - reboot the system
     bios - show BIOS information
+    enterbios - interactive BIOS mode (inspect/change flags)
+    setflag <FLAG> - set a CPU flag from shell
+    acc [get|set <value>] - inspect or set accumulator register
     sysinfo - show system information
     random - generate random number
     bootload - enter bootloader mode
+    entboot - interactive bootloader shell (load, write, dump, run, boot)
     clear - clear screen
     history - show command history
     set <var> <value> - set environment variable
@@ -2257,12 +2613,16 @@ class Shell:
                     return True  # Signal to reboot
                 elif cmd == "bios":
                     self.do_bios(args)
+                elif cmd == "enterbios":
+                    self.do_enterbios(args)
                 elif cmd == "sysinfo":
                     self.do_sysinfo(args)
                 elif cmd == "random":
                     self.do_random(args)
                 elif cmd == "bootload":
                     self.do_bootload(args)
+                elif cmd == "entboot":
+                    self.do_entboot(args)
                 elif cmd == "clear":
                     self.do_clear(args)
                 elif cmd == "history":
@@ -2271,6 +2631,28 @@ class Shell:
                     self.do_set(args)
                 elif cmd == "get":
                     self.do_get(args)
+                elif cmd == "setflag":
+                    if len(args) != 1:
+                        print("Usage: setflag <FLAG>")
+                    else:
+                        name = args[0].upper()
+                        mask = FLAG_NAME_MAP.get(name)
+                        if mask is None:
+                            print("Unknown flag", name)
+                        else:
+                            self.cpu.set_flag(mask)
+                            print(f"Set {name}")
+                elif cmd == "acc":
+                    # acc [get|set <value>]
+                    if not args or args[0] == 'get':
+                        print(f"ACC=0x{self.cpu.acc:08x}")
+                    elif args[0] == 'set' and len(args) == 2:
+                        try:
+                            v = int(args[1], 0)
+                            self.cpu.acc = v & 0xFFFFFFFF
+                            print(f"ACC set to 0x{self.cpu.acc:08x}")
+                        except ValueError:
+                            print("Invalid value")
                 elif cmd == "sleep":
                     self.do_sleep(args)
                 elif cmd == "ping":
@@ -2673,6 +3055,78 @@ class Shell:
                 print(data.decode('utf-8', errors='replace'))
         else:
             print("Failed to get BIOS information")
+
+    def do_enterbios(self, args):
+        """Enter interactive BIOS mode to inspect/change CPU flags and identification"""
+        print("Entering interactive BIOS mode. Type 'help' for BIOS commands.")
+        while True:
+            try:
+                line = input("bios> ").strip()
+            except EOFError:
+                print()
+                break
+            if not line:
+                continue
+            parts = shlex.split(line)
+            cmd = parts[0].lower()
+            args = parts[1:]
+            if cmd in ("exit", "quit", "q"):
+                print("Exiting BIOS mode")
+                break
+            elif cmd == "help":
+                print("BIOS commands: listflags, showflags, set <FLAG>, clear <FLAG>, toggle <FLAG>, cpuid <R#>, info, help, exit")
+            elif cmd == "listflags":
+                for name, mask in sorted(FLAG_NAME_MAP.items()):
+                    print(f"{name}: 0x{mask:08x}")
+            elif cmd == "showflags":
+                f = self.cpu.flags
+                print(f"FLAGS=0x{f:08x}")
+                set_names = [n for n,m in FLAG_NAME_MAP.items() if (f & m)]
+                print("Set:", ", ".join(set_names) if set_names else "<none>")
+            elif cmd == "set" and args:
+                name = args[0].upper()
+                mask = FLAG_NAME_MAP.get(name)
+                if mask is None:
+                    print("Unknown flag", name)
+                else:
+                    self.cpu.set_flag(mask)
+                    print(f"Set {name}")
+            elif cmd == "clear" and args:
+                name = args[0].upper()
+                mask = FLAG_NAME_MAP.get(name)
+                if mask is None:
+                    print("Unknown flag", name)
+                else:
+                    self.cpu.clear_flag(mask)
+                    print(f"Cleared {name}")
+            elif cmd == "toggle" and args:
+                name = args[0].upper()
+                mask = FLAG_NAME_MAP.get(name)
+                if mask is None:
+                    print("Unknown flag", name)
+                else:
+                    if self.cpu.test_flag(mask):
+                        self.cpu.clear_flag(mask)
+                        print(f"Toggled {name}: now cleared")
+                    else:
+                        self.cpu.set_flag(mask)
+                        print(f"Toggled {name}: now set")
+            elif cmd == "cpuid":
+                if not args:
+                    print("Usage: cpuid <R#>")
+                else:
+                    try:
+                        r = self.assembler.parse_reg(args[0].upper())
+                        self.cpu.reg_write(r, self.cpu.flags & 0xFFFFFFFF)
+                        print(f"Wrote 0x{self.cpu.flags:08x} to R{r}")
+                    except Exception as e:
+                        print("Error:", e)
+            elif cmd == "info":
+                info = self.bios.get_system_info()
+                for k,v in info.items():
+                    print(f"{k}: {v}")
+            else:
+                print("Unknown BIOS command. Type 'help'.")
     def do_sysinfo(self, args):
         """Show system information"""
         # Use kernel GET_SYSTEM_INFO syscall
@@ -2717,6 +3171,16 @@ class Shell:
             print("\n[Bootloader execution completed]")
         except Exception as e:
             print(f"Bootloader error: {e}")
+
+    def do_entboot(self, args):
+        """Enter interactive bootloader mode (bootloader provides basic memory/load/run operations)."""
+        print("Entering bootloader interactive mode...")
+        # Ensure bootloader binary is available at 0x7C00 (but interactive mode operates directly)
+        try:
+            # Let Bootloader handle interactive shell which uses the CPU and memory
+            self.bootloader.interactive_shell(self.cpu)
+        except Exception as e:
+            print("Interactive bootloader error:", e)
     def do_clear(self, args):
         """Clear screen"""
         # Use kernel CLEAR_SCREEN syscall
@@ -3167,6 +3631,19 @@ CLI                  ; Clear interrupt flag
 STI                  ; Set interrupt flag
 HALT
 """
+SAMPLE_KERNEL = r"""
+.org 0x1000
+; Tiny kernel that prints a message at 0x1100 (loaded by bootloader)
+; Syscall convention: R0=syscall num, R1=fd, R2=buf, R3=len
+LOADI R0, 1   ; syscall WRITE
+LOADI R1, 1   ; fd=1 stdout
+LOADI R2, 0x1100
+LOADI R3, 15
+SYSCALL R0
+HALT
+.org 0x1100
+.byte 0x4B,0x65,0x72,0x6E,0x65,0x6C,0x20,0x73,0x74,0x61,0x72,0x74,0x65,0x64,0x0A
+"""
 # ---------------------------
 # Utilities & main
 # ---------------------------
@@ -3205,6 +3682,34 @@ def setup_demo_environment(kernel: Kernel, assembler: Assembler):
         kernel.files["/adc_sbb.bin"] = {
             "data": bin_adc_sbb,
             "permissions": 0o755,
+            "created_time": time.time(),
+            "modified_time": time.time()
+        }
+        # tiny kernel image for bootloader to load (constructed programmatically)
+        # Build a small program at 0x1000 that issues a WRITE syscall to print from 0x1100
+        code_words = []
+        code_words.append(pack_instruction(OP_LOADI, 0, 0, 1))     # LOADI R0, 1 (syscall number WRITE)
+        code_words.append(pack_instruction(OP_LOADI, 1, 0, 1))     # LOADI R1, 1 (fd stdout)
+        code_words.append(pack_instruction(OP_LOADI, 2, 0, 0x1100))# LOADI R2, 0x1100 (buf)
+        code_words.append(pack_instruction(OP_LOADI, 3, 0, 15))    # LOADI R3, 15 (len)
+        code_words.append(pack_instruction(OP_SYSCALL, 0, 0, 0))   # SYSCALL
+        code_words.append(pack_instruction(OP_HALT, 0, 0, 0))      # HALT
+        bin_code = b''.join(itob_le(w) for w in code_words)
+        # place message at 0x1100 (256 bytes after 0x1000)
+        pad_len = 0x1100 - 0x1000 - len(bin_code)
+        if pad_len < 0:
+            pad_len = 0
+        bin_kernel = bin_code + (b'\x00' * pad_len) + b"Kernel started\n\0"
+        kernel.files["/kernel.bin"] = {
+            "data": bin_kernel,
+            "permissions": 0o755,
+            "created_time": time.time(),
+            "modified_time": time.time()
+        }
+        # kernel message as separate file (optional)
+        kernel.files["/kernel_msg"] = {
+            "data": b"Kernel started\n",
+            "permissions": 0o644,
             "created_time": time.time(),
             "modified_time": time.time()
         }
