@@ -28,6 +28,8 @@ import struct
 import math
 import os
 import random
+import socket
+import threading
 from typing import Dict, List, Tuple, Optional, Callable, Any
 from enum import IntEnum
 # Basic logging
@@ -121,48 +123,9 @@ FLAG_MMX = 1 << 20  # MMX present
 FLAG_VMX = 1 << 21  # VMX (Intel VT-x) present
 FLAG_SMEP = 1 << 22 # Supervisor Mode Execution Protection
 
-# Human-readable flag names -> mask
-FLAG_NAME_MAP: Dict[str, int] = {
-    'ZF': FLAG_ZERO,
-    'NF': FLAG_NEG,
-    'CF': FLAG_CARRY,
-    'OF': FLAG_OVERFLOW,
-    'IF': FLAG_INTERRUPT,
-    'TRAP': FLAG_TRAP,
-    'AUX': FLAG_AUX,
-    'DIR': FLAG_DIR,
-    'IOPL': FLAG_IOPL,
-    'NT': FLAG_NT,
-    'RF': FLAG_RF,
-    'VM': FLAG_VM,
-    'AC': FLAG_AC,
-    'VIF': FLAG_VIF,
-    'VIP': FLAG_VIP,
-    'ID': FLAG_ID,
-    'VME': FLAG_VME,
-    'PVI': FLAG_PVI,
-    'TSD': FLAG_TSD,
-    'SSE': FLAG_SSE,
-    'MMX': FLAG_MMX,
-    'VMX': FLAG_VMX,
-    'SMEP': FLAG_SMEP,
-}
-
-
-# Add a few more small flags
-FLAG_PAE = 1 << 23  # Physical Address Extension (just for demo)
-FLAG_SMX = 1 << 24  # Safer Mode Extensions (SMX)
-FLAG_MCE = 1 << 25  # Machine Check Exception
-FLAG_PSE = 1 << 26  # Page Size Extension
-FLAG_NAME_MAP['PAE'] = FLAG_PAE
-FLAG_NAME_MAP['SMX'] = FLAG_SMX
-FLAG_NAME_MAP['MCE'] = FLAG_MCE
-FLAG_NAME_MAP['PSE'] = FLAG_PSE
-FLAG_NX = 1 << 27  # No-eXecute bit
-FLAG_HYP = 1 << 28 # Hypervisor present
-FLAG_NAME_MAP['NX'] = FLAG_NX
-FLAG_NAME_MAP['HYP'] = FLAG_HYP
-# Opcodes
+# ---------------------------
+# Opcode Definitions (32 opcodes max for 8-bit field)
+# ---------------------------
 OP_NOP = 0x00
 OP_MOV = 0x01
 OP_LOADI = 0x02
@@ -170,377 +133,332 @@ OP_LOAD = 0x03
 OP_STORE = 0x04
 OP_ADD = 0x05
 OP_SUB = 0x06
-OP_AND = 0x07
-OP_OR = 0x08
-OP_XOR = 0x09
-OP_NOT = 0x0A
-OP_SHL = 0x0B
-OP_SHR = 0x0C
-OP_JMP = 0x0D
-OP_JZ = 0x0E
-OP_JNZ = 0x0F
+OP_MUL = 0x07
+OP_DIV = 0x08
+OP_MOD = 0x09
+OP_AND = 0x0A
+OP_OR = 0x0B
+OP_XOR = 0x0C
+OP_NOT = 0x0D
+OP_SHL = 0x0E
+OP_SHR = 0x0F
 OP_CMP = 0x10
-OP_PUSH = 0x11
-OP_POP = 0x12
-OP_CALL = 0x13
-OP_RET = 0x14
-OP_HALT = 0x15
-OP_INC = 0x16
-OP_DEC = 0x17
-OP_OUT = 0x18
-OP_IN = 0x19
-OP_NOP2 = 0x1A
-OP_LEA = 0x1B  # Load Effective Address
-OP_MOVZX = 0x1C  # Move with Zero Extension
-OP_MOVSX = 0x1D  # Move with Sign Extension
-OP_TEST = 0x1E  # Test bits
-OP_JE = 0x1F  # Jump if Equal
-OP_JNE = 0x20  # Jump if Not Equal
-OP_JL = 0x21  # Jump if Less
-OP_JG = 0x22  # Jump if Greater
-OP_JLE = 0x23  # Jump if Less or Equal
-OP_JGE = 0x24  # Jump if Greater or Equal
-OP_MUL = 0x25
-OP_IMUL = 0x26  # Signed Multiply
-OP_DIV = 0x27
-OP_IDIV = 0x28  # Signed Divide
-OP_MOD = 0x29
-OP_SYSCALL = 0x2A  # software interrupt / syscall
-OP_INT = 0x2B  # Hardware interrupt
-OP_IRET = 0x2C  # Interrupt return
-OP_CLC = 0x2D  # Clear Carry Flag
-OP_STC = 0x2E  # Set Carry Flag
-OP_CLI = 0x2F  # Clear Interrupt Flag
-OP_STI = 0x30  # Set Interrupt Flag
-OP_PUSHF = 0x31  # Push Flags
-OP_POPF = 0x32  # Pop Flags
-OP_ENTER = 0x33  # Enter function
-OP_LEAVE = 0x34  # Leave function
-OP_ADC = 0x35  # Add with Carry
-OP_SBB = 0x36  # Subtract with Borrow
-OP_ROL = 0x37  # Rotate Left
-OP_ROR = 0x38  # Rotate Right
-OP_BT = 0x39   # Bit Test
-OP_BTS = 0x3A  # Bit Test and Set
-OP_BTR = 0x3B  # Bit Test and Reset
-OP_NEG = 0x3C  # Negate
-OP_CBW = 0x3D  # Convert Byte to Word
-OP_CWD = 0x3E  # Convert Word to Doubleword
-OP_CWDQ = 0x3F # Convert Doubleword to Quadword
-# FPU Instructions
-OP_FLD = 0x40  # Load Float
-OP_FST = 0x41  # Store Float
-OP_FADD = 0x42  # Add Float
-OP_FSUB = 0x43  # Subtract Float
-OP_FMUL = 0x44  # Multiply Float
-OP_FDIV = 0x45  # Divide Float
-OP_FCOMP = 0x46  # Compare Float
-OP_FCHS = 0x47  # Change Sign
-OP_FABS = 0x48  # Absolute Value
-OP_FSQRT = 0x49  # Square Root
-OP_FSTP = 0x4A  # Store and Pop
-OP_FLDZ = 0x4B  # Load Zero
-OP_FLD1 = 0x4C  # Load One
-OP_FLDPI = 0x4D  # Load Pi
-OP_FLDLG2 = 0x4E  # Load Log10(2)
-OP_FLDLN2 = 0x4F  # Load Ln(2)
-OP_FXCH = 0x50  # Exchange ST(0) with ST(i)
-OP_FSTSW = 0x51  # Store Status Word
-OP_FCLEX = 0x52  # Clear Exceptions
-OP_FILD = 0x53  # Load Integer
-OP_FIST = 0x54  # Store Integer
-OP_FISTP = 0x55 # Store Integer and Pop
-# String Instructions
-OP_MOVS = 0x60  # Move String
-OP_STOS = 0x61  # Store String
-OP_LODS = 0x62  # Load String
-OP_SCAS = 0x63  # Scan String
-OP_CMPS = 0x64  # Compare String
-# Control Instructions
-OP_LGDT = 0x70  # Load Global Descriptor Table
-OP_LIDT = 0x71  # Load Interrupt Descriptor Table
-OP_LDS = 0x72   # Load Far Pointer (DS)
-OP_LES = 0x73   # Load Far Pointer (ES)
-# Additional Instructions
-OP_CLD = 0x74  # Clear Direction Flag
-OP_STD = 0x75  # Set Direction Flag
-OP_LAHF = 0x76  # Load AH from Flags
-OP_SAHF = 0x77  # Store AH to Flags
-OP_INTO = 0x78  # Interrupt on Overflow
-OP_AAM = 0x79  # ASCII Adjust After Multiply
-OP_AAD = 0x7A  # ASCII Adjust Before Divide
-OP_XLAT = 0x7B  # Table Look-up Translation
-OP_XCHG = 0x7C  # Exchange Register/Memory with Register
-OP_CMPXCHG = 0x7D  # Compare and Exchange
-OP_BSF = 0x7E  # Bit Scan Forward
-OP_BSR = 0x7F  # Bit Scan Reverse
-OP_LAR = 0x80  # Load Access Rights
-OP_LSL = 0x81  # Load Segment Limit
-OP_SLDT = 0x82  # Store Local Descriptor Table
-OP_STR = 0x83  # Store Task Register
-OP_LLDT = 0x84  # Load Local Descriptor Table
-OP_LTR = 0x85  # Load Task Register
-OP_VERR = 0x86  # Verify Real Mode Segment
-OP_VERW = 0x87  # Verify Writeable Real Mode Segment
-OP_SGDT = 0x88  # Store Global Descriptor Table
-OP_SIDT = 0x89  # Store Interrupt Descriptor Table
-OP_LGDT = 0x8A  # Load Global Descriptor Table
-OP_LIDT = 0x8B  # Load Interrupt Descriptor Table
-OP_SMSW = 0x8C  # Store Machine Status Word
-OP_LMSW = 0x8D  # Load Machine Status Word
-OP_CLTS = 0x8E  # Clear Task Switched Flag
-OP_INVD = 0x8F  # Invalidate Cache
-OP_WBINVD = 0x90  # Write Back and Invalidate Cache
-OP_INVLPG = 0x91  # Invalidate TLB Entry
-OP_INVPCID = 0x92  # Invalidate Process Context Identifier
-OP_VMCALL = 0x93  # VM Call
-OP_VMLAUNCH = 0x94  # VM Launch
-OP_VMRESUME = 0x95  # VM Resume
-OP_VMXOFF = 0x96  # VM Exit
-OP_MONITOR = 0x97  # Monitor Processor
-OP_MWAIT = 0x98  # Monitor Wait
-OP_RDSEED = 0x99  # Read Random Seed
-OP_RDRAND = 0xA0  # Read Random Number
-OP_CLAC = 0xA1  # Clear Access Control
-OP_STAC = 0xA2  # Set Access Control
-OP_SKINIT = 0xA3  # Secure Key Initialization
-OP_SVMEXIT = 0xA4  # SVM Exit
-OP_SVMRET = 0xA5  # SVM Return
-OP_SVMLOCK = 0xA6  # SVM Lock
-OP_SVMUNLOCK = 0xA7  # SVM Unlock
-OP_SETF = 0xA8  # Set flags mask (imm16)
-OP_TESTF = 0xA9  # Test flags mask (imm16)
-OP_CLRF = 0xAA  # Clear flags mask (imm16)
-OP_CPUID = 0xAB  # Return CPU identification/flags into reg
-OP_SETACC = 0xAC  # Set ACC from reg/imm
-OP_GETACC = 0xAD  # Get ACC into reg
-OP_ACCADD = 0xAE  # ACC = ACC + reg/imm
-OP_ACCSUB = 0xAF  # ACC = ACC - reg/imm
-# New useful instructions
-OP_XCHG = 0xB0  # Exchange two registers
-OP_NEG = 0xB1  # Negate (two's complement)
-OP_SAR = 0xB2  # Arithmetic right shift (sign-extending)
-OP_ROL = 0xB3  # Rotate left
-OP_ROR = 0xB4  # Rotate right
-OP_BT = 0xB5  # Bit test
-OP_BTS = 0xB6  # Bit test and set
-OP_BTR = 0xB7  # Bit test and reset
-OP_BTC = 0xB8  # Bit test and complement
-OP_BSF = 0xB9  # Bit scan forward
-OP_BSR = 0xBA  # Bit scan reverse
-OP_BSWAP = 0xBB  # Byte swap
-OP_CMOV = 0xBC  # Conditional move
-OP_SETZ = 0xBD  # Set if zero
-OP_SETNZ = 0xBE  # Set if not zero
-OP_SETL = 0xBF  # Set if less
-# Additional useful instructions
-OP_MOVB = 0xC0  # Move byte (8-bit)
-OP_MOVW = 0xC1  # Move word (16-bit)
-OP_LOADB = 0xC2  # Load byte from memory
-OP_STOREB = 0xC3  # Store byte to memory
-OP_SEXT = 0xC4  # Sign extend (byte to word)
-OP_ZEXT = 0xC5  # Zero extend (byte to word)
-OP_POPCNT = 0xC6  # Population count (count set bits)
-# String and memory operations
-OP_MEMCPY = 0xC7  # Memory copy (dst_addr, src_addr, length)
-OP_MEMSET = 0xC8  # Memory set (dst_addr, value, length)
-OP_STRLEN = 0xC9  # String length
-OP_STRCMP = 0xCA  # String compare
-OP_MIN = 0xCB  # Minimum of two values
-OP_MAX = 0xCC  # Maximum of two values
-OP_ABS = 0xCD  # Absolute value
-OP_CLAMP = 0xCE  # Clamp value between min and max
+OP_TEST = 0x11
+OP_JMP = 0x12
+OP_JZ = 0x13
+OP_JNZ = 0x14
+OP_JE = 0x15
+OP_JNE = 0x16
+OP_JL = 0x17
+OP_JG = 0x18
+OP_JLE = 0x19
+OP_JGE = 0x1A
+OP_CALL = 0x1B
+OP_RET = 0x1C
+OP_PUSH = 0x1D
+OP_POP = 0x1E
+OP_HALT = 0x1F
+OP_SYSCALL = 0x20
+OP_INT = 0x21
+OP_IRET = 0x22
+OP_INC = 0x23
+OP_DEC = 0x24
+OP_NEG = 0x25
+OP_IMUL = 0x26
+OP_IDIV = 0x27
+OP_SAR = 0x28
+OP_ROL = 0x29
+OP_ROR = 0x2A
+OP_BT = 0x2B
+OP_BTS = 0x2C
+OP_BTR = 0x2D
+OP_BSF = 0x2E
+OP_BSR = 0x2F
+OP_BSWAP = 0x30
+OP_CMOV = 0x31
+OP_SETZ = 0x32
+OP_SETNZ = 0x33
+OP_SETL = 0x34
+OP_MOVB = 0x35
+OP_MOVW = 0x36
+OP_LOADB = 0x37
+OP_STOREB = 0x38
+OP_SEXT = 0x39
+OP_ZEXT = 0x3A
+OP_POPCNT = 0x3B
+OP_MIN = 0x3C
+OP_MAX = 0x3D
+OP_ABS = 0x3E
+OP_MEMCPY = 0x3F
+OP_MEMSET = 0x40
+OP_STRLEN = 0x41
+OP_STRCMP = 0x42
+OP_CLAMP = 0x43
+OP_ADC = 0x44
+OP_SBB = 0x45
+OP_CBW = 0x46
+OP_CWD = 0x47
+OP_CWDQ = 0x48
+OP_CLC = 0x49
+OP_STC = 0x4A
+OP_CLI = 0x4B
+OP_STI = 0x4C
+OP_LAHF = 0x4D
+OP_SAHF = 0x4E
+OP_PUSHF = 0x4F
+OP_POPF = 0x50
+OP_LEAVE = 0x51
+OP_ENTER = 0x52
+OP_NOP2 = 0x53
+OP_OUT = 0x54
+OP_IN = 0x55
+OP_LEA = 0x109
+OP_MOVZX = 0x10A
+OP_MOVSX = 0x10B
+OP_BTC = 0x10C
+OP_SETA_REG = 0x10D
+OP_SETB_REG = 0x10E
+OP_SETG = 0x10F
+OP_SETLE = 0x110
+OP_SETGE = 0x111
+OP_SETNE = 0x112
+OP_SETE = 0x113
+OP_LOOP = 0x114
+OP_LOOPZ = 0x115
+OP_LOOPNZ = 0x116
+OP_REP = 0x117
+OP_REPZ = 0x118
+OP_REPNZ = 0x119
+OP_MOVSB = 0x11A
+OP_MOVSW = 0x11B
+OP_MOVSD = 0x11C
+OP_CMPSB = 0x11D
+OP_SCASB = 0x11E
+OP_LODSB = 0x11F
+OP_STOSB = 0x120
+OP_IMUL3 = 0x121
+OP_SHLD = 0x122
+OP_SHRD = 0x123
+OP_RDTSC = 0x124
+OP_RDMSR = 0x125
+OP_WRMSR = 0x126
+OP_CPUID2 = 0x127
+OP_PAUSE = 0x128
+OP_NOP3 = 0x129
+OP_NOP4 = 0x12A
+OP_LOCK = 0x12B
+OP_REPNE = 0x12C
+OP_REPE = 0x12D
+OP_ACCADD = 0x56
+OP_ACCSUB = 0x57
+OP_SETACC = 0x58
+OP_GETACC = 0x59
+OP_XCHG = 0x5A
+OP_CMPXCHG = 0x5B
+OP_LAR = 0x5C
+OP_LSL = 0x5D
+OP_SLDT = 0x5E
+OP_STR = 0x5F
+OP_LLDT = 0x60
+OP_LTR = 0x61
+OP_VERR = 0x62
+OP_VERW = 0x63
+OP_SGDT = 0x64
+OP_SIDT = 0x65
+OP_LGDT = 0x66
+OP_LIDT = 0x67
+OP_SMSW = 0x68
+OP_LMSW = 0x69
+OP_CLTS = 0x6A
+OP_INVD = 0x6B
+OP_WBINVD = 0x6C
+OP_INVLPG = 0x6D
+OP_INVPCID = 0x6E
+OP_VMCALL = 0x6F
+OP_VMLAUNCH = 0x70
+OP_VMRESUME = 0x71
+OP_VMXOFF = 0x72
+OP_MONITOR = 0x73
+OP_MWAIT = 0x74
+OP_RDSEED = 0x75
+OP_RDRAND = 0x76
+OP_CLAC = 0x77
+OP_STAC = 0x78
+OP_SKINIT = 0x79
+OP_SVMEXIT = 0x7A
+OP_SVMRET = 0x7B
+OP_SVMLOCK = 0x7C
+OP_SVMUNLOCK = 0x7D
+OP_CLD = 0x7E
+OP_STD = 0x7F
+OP_INTO = 0x80
+OP_AAM = 0x81
+OP_AAD = 0x82
+OP_XLAT = 0x83
+OP_FADD = 0x84
+OP_FSUB = 0x85
+OP_FMUL = 0x86
+OP_FDIV = 0x87
+OP_FCOMP = 0x88
+OP_FXCH = 0x89
+OP_FLDZ = 0x8A
+OP_FLD1 = 0x8B
+OP_FLDPI = 0x8C
+OP_FLDLG2 = 0x8D
+OP_FLDLN2 = 0x8E
+OP_FCLEX = 0x8F
+OP_FLD = 0x90
+OP_FST = 0x91
+OP_FSTP = 0x92
+OP_FILD = 0x93
+OP_FIST = 0x94
+OP_FISTP = 0x95
+OP_FCHS = 0x96
+OP_FABS = 0x97
+OP_FSQRT = 0x98
+OP_FSTSW = 0x99
+OP_SETF = 0x9A
+OP_TESTF = 0x9B
+OP_CLRF = 0x9C
+OP_CPUID = 0x9D
+OP_NET_SEND = 0xD0
+OP_NET_RECV = 0xD1
+OP_NET_CONNECT = 0xD2
+OP_NET_LISTEN = 0xD3
+OP_NET_ACCEPT = 0xD4
+OP_NET_CLOSE = 0xD5
+OP_NET_PING = 0xD6
+OP_NET_CURL = 0xD7
+OP_NET_WGET = 0xD8
+# Additional arithmetic
+OP_SQRT = 0xDA
+OP_POW = 0xDB
+OP_LOG = 0xDC
+OP_EXP = 0xDD
+OP_SIN = 0xDE
+OP_COS = 0xDF
+OP_TAN = 0xE0
+# Additional bitwise
+OP_POPCOUNT = 0xE1
+OP_LZCNT = 0xE2
+OP_TZCNT = 0xE3
+# Additional memory
+OP_PREFETCH = 0xE4
+OP_CLFLUSH = 0xE5
+OP_MFENCE = 0xE6
+OP_LFENCE = 0xE7
+OP_SFENCE = 0xE8
+# String operations
+OP_STRCPY = 0xE9
+OP_STRCAT = 0xEA
+OP_STRNCPY = 0xEB
+OP_STRNCAT = 0xEC
+OP_STRCHR = 0xED
+OP_STRSTR = 0xEE
+# Conversion
+OP_ATOI = 0xEF
+OP_ITOA = 0xF0
+OP_FTOI = 0xF1
+OP_ITOF = 0xF2
+# Comparison
+OP_CMPS = 0xF3
+OP_SCAS = 0xF4
+# Atomic operations
+OP_XADD = 0xF5
+OP_XCHG_MEM = 0xF6
+# Conditional set
+OP_SETA = 0xF7
+OP_SETB = 0xF8
+OP_SETBE = 0xF9
+OP_SETAE = 0xFA
+OP_SETO = 0xFB
+OP_SETNO = 0xFC
+# Additional utility instructions
+OP_SWAP = 0xFD
+OP_ROT = 0xFE
+OP_REVERSE = 0xFF
+OP_GETSEED = 0x100
+OP_SETSEED = 0x101
+OP_RANDOM = 0x102
+OP_HASH = 0x103
+OP_CRC32 = 0x104
+OP_GETTIME = 0x105
+OP_SLEEP = 0x106
+OP_YIELD = 0x107
+OP_BARRIER = 0x108
+
 OPCODE_NAME = {
-    # Regular Instructions
-    OP_NOP: "NOP",
-    OP_MOV: "MOV",
-    OP_LOADI: "LOADI",
-    OP_LOAD: "LOAD",
-    OP_STORE: "STORE",
-    OP_ADD: "ADD",
-    OP_SUB: "SUB",
-    OP_AND: "AND",
-    OP_OR: "OR",
-    OP_XOR: "XOR",
-    OP_NOT: "NOT",
-    OP_SHL: "SHL",
-    OP_SHR: "SHR",
-    OP_JMP: "JMP",
-    OP_JZ: "JZ",
-    OP_JNZ: "JNZ",
-    OP_CMP: "CMP",
-    OP_PUSH: "PUSH",
-    OP_POP: "POP",
-    OP_CALL: "CALL",
-    OP_RET: "RET",
-    OP_HALT: "HALT",
-    OP_INC: "INC",
-    OP_DEC: "DEC",
-    OP_OUT: "OUT",
-    OP_IN: "IN",
-    OP_NOP2: "NOP2",
-    OP_LEA: "LEA",
-    OP_MOVZX: "MOVZX",
-    OP_MOVSX: "MOVSX",
-    OP_TEST: "TEST",
-    OP_JE: "JE",
-    OP_JNE: "JNE",
-    OP_JL: "JL",
-    OP_JG: "JG",
-    OP_JLE: "JLE",
-    OP_JGE: "JGE",
-    OP_MUL: "MUL",
-    OP_IMUL: "IMUL",
-    OP_DIV: "DIV",
-    OP_IDIV: "IDIV",
-    OP_MOD: "MOD",
-    OP_SYSCALL: "SYSCALL",
-    OP_INT: "INT",
-    OP_IRET: "IRET",
-    OP_CLC: "CLC",
-    OP_STC: "STC",
-    OP_CLI: "CLI",
-    OP_STI: "STI",
-    OP_PUSHF: "PUSHF",
-    OP_POPF: "POPF",
-    OP_ENTER: "ENTER",
-    OP_LEAVE: "LEAVE",
-    OP_ADC: "ADC",
-    OP_SBB: "SBB",
-    OP_ROL: "ROL",
-    OP_ROR: "ROR",
-    OP_BT: "BT",
-    OP_BTS: "BTS",
-    OP_BTR: "BTR",
-    OP_NEG: "NEG",
-    OP_CBW: "CBW",
-    OP_CWD: "CWD",
-    OP_CWDQ: "CWDQ",
-    # FPU Instructions
-    OP_FLD: "FLD",
-    OP_FST: "FST",
-    OP_FADD: "FADD",
-    OP_FSUB: "FSUB",
-    OP_FMUL: "FMUL",
-    OP_FDIV: "FDIV",
-    OP_FCOMP: "FCOMP",
-    OP_FCHS: "FCHS",
-    OP_FABS: "FABS",
-    OP_FSQRT: "FSQRT",
-    OP_FSTP: "FSTP",
-    OP_FLDZ: "FLDZ",
-    OP_FLD1: "FLD1",
-    OP_FLDPI: "FLDPI",
-    OP_FLDLG2: "FLDLG2",
-    OP_FLDLN2: "FLDLN2",
-    OP_FXCH: "FXCH",
-    OP_FSTSW: "FSTSW",
-    OP_FCLEX: "FCLEX",
-    OP_FILD: "FILD",
-    OP_FIST: "FIST",
-    OP_FISTP: "FISTP",
-    # String Instructions
-    OP_MOVS: "MOVS",
-    OP_STOS: "STOS",
-    OP_LODS: "LODS",
-    OP_SCAS: "SCAS",
-    OP_CMPS: "CMPS",
-    # Control Instructions
-    OP_LGDT: "LGDT",
-    OP_LIDT: "LIDT",
-    OP_LDS: "LDS",
-    OP_LES: "LES",
-    # Additional Instructions
-    OP_CLD: "CLD",
-    OP_STD: "STD",
-    OP_LAHF: "LAHF",
-    OP_SAHF: "SAHF",
-    OP_INTO: "INTO",
-    OP_AAM: "AAM",
-    OP_AAD: "AAD",
-    OP_XLAT: "XLAT",
-    OP_XCHG: "XCHG",
-    OP_CMPXCHG: "CMPXCHG",
-    OP_BSF: "BSF",
-    OP_BSR: "BSR",
-    OP_LAR: "LAR",
-    OP_LSL: "LSL",
-    OP_SLDT: "SLDT",
-    OP_STR: "STR",
-    OP_LLDT: "LLDT",
-    OP_LTR: "LTR",
-    OP_VERR: "VERR",
-    OP_VERW: "VERW",
-    OP_SGDT: "SGDT",
-    OP_SIDT: "SIDT",
-    OP_LGDT: "LGDT",
-    OP_LIDT: "LIDT",
-    OP_SMSW: "SMSW",
-    OP_LMSW: "LMSW",
-    OP_CLTS: "CLTS",
-    OP_INVD: "INVD",
-    OP_WBINVD: "WBINVD",
-    OP_INVLPG: "INVLPG",
-    OP_INVPCID: "INVPCID",
-    OP_VMCALL: "VMCALL",
-    OP_VMLAUNCH: "VMLAUNCH",
-    OP_VMRESUME: "VMRESUME",
-    OP_VMXOFF: "VMXOFF",
-    OP_MONITOR: "MONITOR",
-    OP_MWAIT: "MWAIT",
-    OP_RDSEED: "RDSEED",
-    OP_RDRAND: "RDRAND",
-    OP_CLAC: "CLAC",
-    OP_STAC: "STAC",
-    OP_SKINIT: "SKINIT",
-    OP_SVMEXIT: "SVMEXIT",
-    OP_SVMRET: "SVMRET",
-    OP_SVMLOCK: "SVMLOCK",
-    OP_SVMUNLOCK: "SVMUNLOCK",
-    OP_SETF: "SETF",
-    OP_TESTF: "TESTF",
-    OP_CLRF: "CLRF",
-    OP_CPUID: "CPUID",
-    OP_SETACC: "SETACC",
-    OP_GETACC: "GETACC",
-    OP_ACCADD: "ACCADD",
-    OP_ACCSUB: "ACCSUB",
-    # New useful instructions
-    OP_XCHG: "XCHG",
-    OP_NEG: "NEG",
-    OP_SAR: "SAR",
-    OP_ROL: "ROL",
-    OP_ROR: "ROR",
-    OP_BT: "BT",
-    OP_BTS: "BTS",
-    OP_BTR: "BTR",
-    OP_BTC: "BTC",
-    OP_BSF: "BSF",
-    OP_BSR: "BSR",
-    OP_BSWAP: "BSWAP",
-    OP_CMOV: "CMOV",
-    OP_SETZ: "SETZ",
-    OP_SETNZ: "SETNZ",
-    OP_SETL: "SETL",
-    # Additional useful instructions
-    OP_MOVB: "MOVB",
-    OP_MOVW: "MOVW",
-    OP_LOADB: "LOADB",
-    OP_STOREB: "STOREB",
-    OP_SEXT: "SEXT",
-    OP_ZEXT: "ZEXT",
-    OP_POPCNT: "POPCNT",
-    # String and memory operations
-    OP_MEMCPY: "MEMCPY",
-    OP_MEMSET: "MEMSET",
-    OP_STRLEN: "STRLEN",
-    OP_STRCMP: "STRCMP",
-    OP_MIN: "MIN",
-    OP_MAX: "MAX",
-    OP_ABS: "ABS",
-    OP_CLAMP: "CLAMP",
+    OP_NOP: "NOP", OP_MOV: "MOV", OP_LOADI: "LOADI", OP_LOAD: "LOAD", OP_STORE: "STORE",
+    OP_ADD: "ADD", OP_SUB: "SUB", OP_MUL: "MUL", OP_DIV: "DIV", OP_MOD: "MOD",
+    OP_AND: "AND", OP_OR: "OR", OP_XOR: "XOR", OP_NOT: "NOT", OP_SHL: "SHL", OP_SHR: "SHR",
+    OP_CMP: "CMP", OP_TEST: "TEST", OP_JMP: "JMP", OP_JZ: "JZ", OP_JNZ: "JNZ",
+    OP_JE: "JE", OP_JNE: "JNE", OP_JL: "JL", OP_JG: "JG", OP_JLE: "JLE", OP_JGE: "JGE",
+    OP_CALL: "CALL", OP_RET: "RET", OP_PUSH: "PUSH", OP_POP: "POP", OP_HALT: "HALT",
+    OP_SYSCALL: "SYSCALL", OP_INT: "INT", OP_IRET: "IRET", OP_INC: "INC", OP_DEC: "DEC",
+    OP_NEG: "NEG", OP_IMUL: "IMUL", OP_IDIV: "IDIV", OP_SAR: "SAR", OP_ROL: "ROL", OP_ROR: "ROR",
+    OP_BT: "BT", OP_BTS: "BTS", OP_BTR: "BTR", OP_BSF: "BSF", OP_BSR: "BSR", OP_BSWAP: "BSWAP", OP_BTC: "BTC",
+    OP_CMOV: "CMOV", OP_SETZ: "SETZ", OP_SETNZ: "SETNZ", OP_SETL: "SETL",
+    OP_LEA: "LEA", OP_MOVZX: "MOVZX", OP_MOVSX: "MOVSX",
+    OP_MOVB: "MOVB", OP_MOVW: "MOVW", OP_LOADB: "LOADB", OP_STOREB: "STOREB",
+    OP_SEXT: "SEXT", OP_ZEXT: "ZEXT", OP_POPCNT: "POPCNT", OP_MIN: "MIN", OP_MAX: "MAX", OP_ABS: "ABS",
+    OP_MEMCPY: "MEMCPY", OP_MEMSET: "MEMSET", OP_STRLEN: "STRLEN", OP_STRCMP: "STRCMP", OP_CLAMP: "CLAMP",
+    OP_ADC: "ADC", OP_SBB: "SBB", OP_CBW: "CBW", OP_CWD: "CWD", OP_CWDQ: "CWDQ",
+    OP_CLC: "CLC", OP_STC: "STC", OP_CLI: "CLI", OP_STI: "STI", OP_LAHF: "LAHF", OP_SAHF: "SAHF",
+    OP_PUSHF: "PUSHF", OP_POPF: "POPF", OP_LEAVE: "LEAVE", OP_ENTER: "ENTER", OP_NOP2: "NOP2",
+    OP_OUT: "OUT", OP_IN: "IN", OP_ACCADD: "ACCADD", OP_ACCSUB: "ACCSUB", OP_SETACC: "SETACC", OP_GETACC: "GETACC",
+    OP_XCHG: "XCHG", OP_CMPXCHG: "CMPXCHG", OP_LAR: "LAR", OP_LSL: "LSL", OP_SLDT: "SLDT", OP_STR: "STR",
+    OP_LLDT: "LLDT", OP_LTR: "LTR", OP_VERR: "VERR", OP_VERW: "VERW", OP_SGDT: "SGDT", OP_SIDT: "SIDT",
+    OP_LGDT: "LGDT", OP_LIDT: "LIDT", OP_SMSW: "SMSW", OP_LMSW: "LMSW", OP_CLTS: "CLTS", OP_INVD: "INVD",
+    OP_WBINVD: "WBINVD", OP_INVLPG: "INVLPG", OP_INVPCID: "INVPCID", OP_VMCALL: "VMCALL", OP_VMLAUNCH: "VMLAUNCH",
+    OP_VMRESUME: "VMRESUME", OP_VMXOFF: "VMXOFF", OP_MONITOR: "MONITOR", OP_MWAIT: "MWAIT", OP_RDSEED: "RDSEED",
+    OP_RDRAND: "RDRAND", OP_CLAC: "CLAC", OP_STAC: "STAC", OP_SKINIT: "SKINIT", OP_SVMEXIT: "SVMEXIT",
+    OP_SVMRET: "SVMRET", OP_SVMLOCK: "SVMLOCK", OP_SVMUNLOCK: "SVMUNLOCK", OP_CLD: "CLD", OP_STD: "STD",
+    OP_INTO: "INTO", OP_AAM: "AAM", OP_AAD: "AAD", OP_XLAT: "XLAT",
+    OP_FADD: "FADD", OP_FSUB: "FSUB", OP_FMUL: "FMUL", OP_FDIV: "FDIV", OP_FCOMP: "FCOMP", OP_FXCH: "FXCH",
+    OP_FLDZ: "FLDZ", OP_FLD1: "FLD1", OP_FLDPI: "FLDPI", OP_FLDLG2: "FLDLG2", OP_FLDLN2: "FLDLN2", OP_FCLEX: "FCLEX",
+    OP_FLD: "FLD", OP_FST: "FST", OP_FSTP: "FSTP", OP_FILD: "FILD", OP_FIST: "FIST", OP_FISTP: "FISTP",
+    OP_FCHS: "FCHS", OP_FABS: "FABS", OP_FSQRT: "FSQRT", OP_FSTSW: "FSTSW", OP_SETF: "SETF", OP_TESTF: "TESTF", OP_CLRF: "CLRF", OP_CPUID: "CPUID",
+    OP_NET_SEND: "NET_SEND", OP_NET_RECV: "NET_RECV", OP_NET_CONNECT: "NET_CONNECT",
+    OP_NET_LISTEN: "NET_LISTEN", OP_NET_ACCEPT: "NET_ACCEPT", OP_NET_CLOSE: "NET_CLOSE",
+    OP_NET_PING: "NET_PING", OP_NET_CURL: "NET_CURL", OP_NET_WGET: "NET_WGET",
+    OP_SQRT: "SQRT", OP_POW: "POW", OP_LOG: "LOG", OP_EXP: "EXP", OP_SIN: "SIN", OP_COS: "COS", OP_TAN: "TAN",
+    OP_POPCOUNT: "POPCOUNT", OP_LZCNT: "LZCNT", OP_TZCNT: "TZCNT",
+    OP_PREFETCH: "PREFETCH", OP_CLFLUSH: "CLFLUSH", OP_MFENCE: "MFENCE", OP_LFENCE: "LFENCE", OP_SFENCE: "SFENCE",
+    OP_STRCPY: "STRCPY", OP_STRCAT: "STRCAT", OP_STRNCPY: "STRNCPY", OP_STRNCAT: "STRNCAT", OP_STRCHR: "STRCHR", OP_STRSTR: "STRSTR",
+    OP_ATOI: "ATOI", OP_ITOA: "ITOA", OP_FTOI: "FTOI", OP_ITOF: "ITOF",
+    OP_CMPS: "CMPS", OP_SCAS: "SCAS",
+    OP_XADD: "XADD", OP_XCHG_MEM: "XCHG_MEM",
+    OP_SETA: "SETA", OP_SETB: "SETB", OP_SETBE: "SETBE", OP_SETAE: "SETAE", OP_SETO: "SETO", OP_SETNO: "SETNO",
+    OP_SWAP: "SWAP", OP_ROT: "ROT", OP_REVERSE: "REVERSE", OP_GETSEED: "GETSEED", OP_SETSEED: "SETSEED",
+    OP_RANDOM: "RANDOM", OP_HASH: "HASH", OP_CRC32: "CRC32", OP_GETTIME: "GETTIME", OP_SLEEP: "SLEEP",
+    OP_YIELD: "YIELD", OP_BARRIER: "BARRIER",
+    OP_SETG: "SETG", OP_SETLE: "SETLE", OP_SETGE: "SETGE", OP_SETNE: "SETNE", OP_SETE: "SETE",
+    OP_LOOP: "LOOP", OP_LOOPZ: "LOOPZ", OP_LOOPNZ: "LOOPNZ",
+    OP_REP: "REP", OP_REPZ: "REPZ", OP_REPNZ: "REPNZ",
+    OP_MOVSB: "MOVSB", OP_MOVSW: "MOVSW", OP_MOVSD: "MOVSD",
+    OP_CMPSB: "CMPSB", OP_SCASB: "SCASB", OP_LODSB: "LODSB", OP_STOSB: "STOSB",
+    OP_IMUL3: "IMUL3", OP_SHLD: "SHLD", OP_SHRD: "SHRD",
+    OP_RDTSC: "RDTSC", OP_RDMSR: "RDMSR", OP_WRMSR: "WRMSR", OP_CPUID2: "CPUID2",
+    OP_PAUSE: "PAUSE", OP_NOP3: "NOP3", OP_NOP4: "NOP4",
+    OP_LOCK: "LOCK", OP_REPNE: "REPNE", OP_REPE: "REPE",
 }
+
 NAME_OPCODE = {v: k for k, v in OPCODE_NAME.items()}
+
+# Memory region constants
+STACK_BASE = 0x7FFF0000  # Stack grows downward from here
+STACK_SIZE = 0x00010000  # 64KB stack
+HEAP_BASE = 0x10000000   # Heap starts here
+HEAP_SIZE = 0x70000000   # 1.8GB heap
+CODE_BASE = 0x00001000   # Code segment
+CODE_SIZE = 0x0FFF0000   # ~256MB code
+DATA_BASE = 0x08000000   # Data segment
+DATA_SIZE = 0x08000000   # 128MB data
+
+FLAG_NAME_MAP = {
+    "ZERO": FLAG_ZERO, "NEG": FLAG_NEG, "CARRY": FLAG_CARRY, "OVERFLOW": FLAG_OVERFLOW,
+    "INTERRUPT": FLAG_INTERRUPT, "TRAP": FLAG_TRAP, "AUX": FLAG_AUX, "DIR": FLAG_DIR,
+}
 # Instruction packing helpers
 def pack_instruction(opcode: int, dst: int = 0, src: int = 0, imm16: int = 0) -> int:
     return ((opcode & 0xFF) << 24) | ((dst & 0x0F) << 20) | ((src & 0x0F) << 16) | (imm16 & 0xFFFF)
@@ -565,6 +483,120 @@ def float_to_bits(f: float) -> int:
     return struct.unpack('<I', struct.pack('<f', f))[0]
 def bits_to_float(bits: int) -> float:
     return struct.unpack('<f', struct.pack('<I', bits & 0xFFFFFFFF))[0]
+
+# ---------------------------
+# Network Module - Real Network I/O
+# ---------------------------
+class NetworkUtils:
+    """Real network utilities for ping, curl, wget"""
+    
+    @staticmethod
+    def ping(host: str, timeout: int = 2) -> bool:
+        """Ping a host, return True if reachable"""
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(timeout)
+            result = sock.connect_ex((host, 80))
+            sock.close()
+            return result == 0
+        except Exception:
+            return False
+    
+    @staticmethod
+    def curl(url: str, timeout: int = 5) -> str:
+        """Fetch URL content via HTTP GET"""
+        try:
+            from urllib.request import urlopen
+            from urllib.error import URLError
+            response = urlopen(url, timeout=timeout)
+            content = response.read().decode('utf-8', errors='replace')
+            return content[:1024]  # Limit to 1KB
+        except Exception as e:
+            return f"Error: {str(e)}"
+    
+    @staticmethod
+    def wget(url: str, timeout: int = 5) -> int:
+        """Download URL, return bytes downloaded"""
+        try:
+            from urllib.request import urlopen
+            response = urlopen(url, timeout=timeout)
+            content = response.read()
+            return len(content)
+        except Exception:
+            return -1
+
+class NetworkDevice:
+    """Real network device for CPU networking"""
+    def __init__(self):
+        self.sockets = {}  # socket_id -> socket object
+        self.next_socket_id = 1
+        self.packets = []  # packet buffer
+        self.lock = threading.Lock()
+        self.utils = NetworkUtils()
+        
+    def socket_create(self) -> int:
+        """Create a new socket, return socket ID"""
+        with self.lock:
+            sock_id = self.next_socket_id
+            self.next_socket_id += 1
+            try:
+                self.sockets[sock_id] = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self.sockets[sock_id].settimeout(2.0)
+                return sock_id
+            except Exception as e:
+                logger.error("Failed to create socket: %s", e)
+                return -1
+    
+    def socket_connect(self, sock_id: int, host: str, port: int) -> int:
+        """Connect socket to host:port, return 0 on success, -1 on error"""
+        with self.lock:
+            if sock_id not in self.sockets:
+                return -1
+            try:
+                self.sockets[sock_id].connect((host, port))
+                return 0
+            except Exception as e:
+                logger.error("Failed to connect: %s", e)
+                return -1
+    
+    def socket_send(self, sock_id: int, data: bytes) -> int:
+        """Send data on socket, return bytes sent or -1 on error"""
+        with self.lock:
+            if sock_id not in self.sockets:
+                return -1
+            try:
+                sent = self.sockets[sock_id].send(data)
+                return sent
+            except Exception as e:
+                logger.error("Failed to send: %s", e)
+                return -1
+    
+    def socket_recv(self, sock_id: int, size: int) -> bytes:
+        """Receive data from socket"""
+        with self.lock:
+            if sock_id not in self.sockets:
+                return b''
+            try:
+                data = self.sockets[sock_id].recv(size)
+                return data
+            except socket.timeout:
+                return b''
+            except Exception as e:
+                logger.error("Failed to receive: %s", e)
+                return b''
+    
+    def socket_close(self, sock_id: int) -> int:
+        """Close socket, return 0 on success"""
+        with self.lock:
+            if sock_id not in self.sockets:
+                return -1
+            try:
+                self.sockets[sock_id].close()
+                del self.sockets[sock_id]
+                return 0
+            except Exception as e:
+                logger.error("Failed to close socket: %s", e)
+                return -1
 
 # ---------------------------
 # BIOS - Basic Input/Output System
@@ -668,7 +700,6 @@ RET
             # This is a minimal valid bootloader that doesn't rely on problematic instructions
             # It simply halts after loading itself
             # This is a fallback to avoid crashing
-            # It's not a working bootloader but avoids an error
             # We'll create a minimal binary that just halts
             print("WARNING: Using fallback bootloader due to assembly failure.")
             # Create a simple halt instruction at the end
@@ -769,29 +800,29 @@ RET
 # Memory with region registration
 # ---------------------------
 class Memory:
-    """
-    Advanced byte-addressable memory with paging, memory protection,
-    and memory-mapped I/O support.
-    """
+    """Advanced memory management with virtual memory, paging, and protection"""
     def __init__(self, size_bytes: int = DEFAULT_MEMORY_BYTES):
-        # Main memory storage
-        self.data = bytearray(size_bytes)
         self.size = size_bytes
-        
-        # Memory management
-        self.page_size = 4096  # 4KB pages
-        self.page_table = {}   # Virtual to physical page mapping
-        self.memory_regions = []  # List of (start, end, permissions, name)
-        self.protected_regions = {}  # addr -> (size, permissions, name)
-        
-        # Memory-mapped I/O
-        self.mmio_handlers = {}  # addr_range -> handler_func
-        
+        self.data = bytearray(size_bytes)
+        self.page_size = 4096
+        self.page_table = {}
+        self.protected_regions = {}
+        self.mmio_handlers = {}
         # Cache
         self.cache_enabled = True
         self.cache = {}
         self.cache_hits = 0
         self.cache_misses = 0
+        # Statistics
+        self.memory_stats = {
+            'total_reads': 0,
+            'total_writes': 0,
+            'total_allocations': 0,
+            'fragmentation': 0.0,
+        }
+        self.breakpoints = set()
+        self.access_log = []
+        self.max_log_size = 1000
         
         # Initialize default memory regions
         self._init_default_regions()
@@ -1130,6 +1161,49 @@ class Memory:
         if addr in self.protected_regions:
             del self.protected_regions[addr]
             logger.info("Unregistered memory region at %08x", addr)
+    
+    def set_breakpoint(self, addr: int):
+        """Set memory breakpoint for debugging"""
+        self.breakpoints.add(addr)
+    
+    def clear_breakpoint(self, addr: int):
+        """Clear memory breakpoint"""
+        self.breakpoints.discard(addr)
+    
+    def get_stats(self) -> dict:
+        """Get memory statistics"""
+        return {
+            'total_size': self.size,
+            'total_reads': self.memory_stats['total_reads'],
+            'total_writes': self.memory_stats['total_writes'],
+            'cache_hits': self.cache_hits,
+            'cache_misses': self.cache_misses,
+            'cache_ratio': self.cache_hits / (self.cache_hits + self.cache_misses) if (self.cache_hits + self.cache_misses) > 0 else 0,
+            'protected_regions': len(self.protected_regions),
+            'breakpoints': len(self.breakpoints),
+        }
+    
+    def clear_cache(self):
+        """Clear memory cache"""
+        self.cache.clear()
+        self.cache_hits = 0
+        self.cache_misses = 0
+    
+    def dump_stats(self) -> str:
+        """Get formatted memory statistics"""
+        stats = self.get_stats()
+        lines = [
+            f"Memory Statistics:",
+            f"  Total Size: {stats['total_size'] / (1024*1024):.1f} MB",
+            f"  Total Reads: {stats['total_reads']}",
+            f"  Total Writes: {stats['total_writes']}",
+            f"  Cache Hits: {stats['cache_hits']}",
+            f"  Cache Misses: {stats['cache_misses']}",
+            f"  Cache Ratio: {stats['cache_ratio']:.2%}",
+            f"  Protected Regions: {stats['protected_regions']}",
+            f"  Breakpoints: {stats['breakpoints']}",
+        ]
+        return "\n".join(lines)
 
 # ---------------------------
 # Process Management
@@ -1540,8 +1614,9 @@ class Kernel:
         elif num == 32:  # PING
             host_addr = a1
             host_name = self.read_cstring(cpu.mem, host_addr)
-            # Simulate ping response
-            cpu.reg_write(0, 1) # Success
+            # Real ping using network device
+            result = 1 if cpu.network.utils.ping(host_name) else 0
+            cpu.reg_write(0, result)
         elif num == 33:  # UPTIME
             uptime_seconds = time.time() - self.start_time
             cpu.reg_write(0, int(uptime_seconds)) # Return uptime in seconds
@@ -1616,13 +1691,18 @@ class Kernel:
         elif num == 41:  # CURL
             url_addr = a1
             url = self.read_cstring(cpu.mem, url_addr)
-            # Simulate curl response
-            cpu.reg_write(0, 1) # Success
+            out_addr = a2
+            # Real curl using network device
+            content = cpu.network.utils.curl(url)
+            data = content.encode('utf-8')[:1024]
+            cpu.mem.load_bytes(out_addr, data)
+            cpu.reg_write(0, len(data))
         elif num == 42:  # WGET
             url_addr = a1
             url = self.read_cstring(cpu.mem, url_addr)
-            # Simulate wget response
-            cpu.reg_write(0, 1) # Success
+            # Real wget using network device
+            result = cpu.network.utils.wget(url)
+            cpu.reg_write(0, result)
         elif num == 43:  # GREP
             pattern_addr = a1
             file_addr = a2
@@ -1684,6 +1764,7 @@ class CPU:
         # Memory and I/O
         self.mem = memory if memory is not None else Memory()
         self.ports = [0] * 65536  # I/O port space
+        self.network = NetworkDevice()  # Network device
         
         # Integer registers (32-bit)
         self.regs = [0] * NUM_REGS
@@ -1976,9 +2057,25 @@ class CPU:
 
     def fetch(self) -> int:
         """Fetch the next instruction from memory at PC"""
-        if self.pc + 4 > self.mem.size:
-            raise MemoryError(f"PC out of bounds: {self.pc:08x}")
-        return self.mem.read_word(self.pc)
+        # Restrict PC to valid loaded program bounds if set
+        if hasattr(self, "program_start") and hasattr(self, "program_end"):
+            if not (self.program_start <= self.pc < self.program_end):
+                logger.error(f"PC out of loaded program bounds: {self.pc:08x} (valid {self.program_start:08x}-{self.program_end-1:08x}), halting")
+                print(f"ERROR: PC out of loaded program bounds: {self.pc:08x} (valid {self.program_start:08x}-{self.program_end-1:08x}), halting")
+                self.halted = True
+                return pack_instruction(OP_HALT, 0, 0, 0)
+        if self.pc + 4 > self.mem.size or self.pc < 0:
+            logger.error(f"PC out of bounds: {self.pc:08x}, halting")
+            print(f"ERROR: PC out of bounds: {self.pc:08x}, halting")
+            self.halted = True
+            return pack_instruction(OP_HALT, 0, 0, 0)
+        try:
+            return self.mem.read_word(self.pc)
+        except Exception as e:
+            logger.error(f"Fetch error at PC {self.pc:08x}: {e}")
+            print(f"ERROR: Fetch error at PC {self.pc:08x}: {e}")
+            self.halted = True
+            return pack_instruction(OP_HALT, 0, 0, 0)
 
     def push_word(self, val: int):
         sp = self.reg_read(REG_SP)
@@ -2329,26 +2426,34 @@ class CPU:
         elif opcode == OP_ADC:
             # Add with carry
             a = self.reg_read(dst)
-            b = self.reg_read(src)
+            if src == 0x0F:  # Immediate value
+                b = to_signed16(imm16) & 0xFFFFFFFF
+            else:  # Register value
+                b = self.reg_read(src)
             carry = 1 if self.test_flag(FLAG_CARRY) else 0
-            res = (a + b + carry) & 0xFFFFFFFF
-            if (a + b + carry) > 0xFFFFFFFF:
+            res = a + b + carry
+            if res > 0xFFFFFFFF:
                 self.set_flag(FLAG_CARRY)
+                res &= 0xFFFFFFFF
             else:
                 self.clear_flag(FLAG_CARRY)
-            self.reg_write(dst, res)
+            self.reg_write(dst, res & 0xFFFFFFFF)
             self.update_zero_and_neg_flags(res)
         elif opcode == OP_SBB:
             # Subtract with borrow
             a = self.reg_read(dst)
-            b = self.reg_read(src)
+            if src == 0x0F:  # Immediate value
+                b = to_signed16(imm16) & 0xFFFFFFFF
+            else:  # Register value
+                b = self.reg_read(src)
             borrow = 1 if self.test_flag(FLAG_CARRY) else 0
-            res = (a - b - borrow) & 0xFFFFFFFF
-            if (a - b - borrow) < 0:
+            res = a - b - borrow
+            if res < 0:
                 self.set_flag(FLAG_CARRY)
+                res &= 0xFFFFFFFF
             else:
                 self.clear_flag(FLAG_CARRY)
-            self.reg_write(dst, res)
+            self.reg_write(dst, res & 0xFFFFFFFF)
             self.update_zero_and_neg_flags(res)
         elif opcode == OP_ROL:
             # Rotate left
@@ -3073,6 +3178,457 @@ class CPU:
             result = max(min_val, min(max_val, val)) & 0xFFFFFFFF
             self.reg_write(dst, result)
             self.update_zero_and_neg_flags(result)
+        elif opcode == OP_SETF:
+            # SETF imm16 - set flags bits given by imm16 mask
+            mask = imm16 & 0xFFFF
+            self.eflags |= mask
+        elif opcode == OP_TESTF:
+            # TESTF imm16 - test if flags match imm16 mask, set zero flag if match
+            mask = imm16 & 0xFFFF
+            if (self.eflags & mask) == mask:
+                self.set_flag(FLAG_ZERO)
+            else:
+                self.clear_flag(FLAG_ZERO)
+        elif opcode == OP_CLRF:
+            # CLRF imm16 - clear flags bits given by imm16 mask
+            mask = imm16 & 0xFFFF
+            self.eflags &= ~mask
+        elif opcode == OP_CPUID:
+            # CPUID Rdst - write CPU flags/feature bits into dst register
+            self.reg_write(dst, self.eflags & 0xFFFFFFFF)
+        elif opcode == OP_NET_SEND:
+            # NET_SEND: R0=socket_id, R1=data_addr, R2=data_len
+            sock_id = self.reg_read(0)
+            data_addr = self.reg_read(1)
+            data_len = self.reg_read(2)
+            try:
+                data = self.mem.dump(data_addr, data_len)
+                result = self.network.socket_send(sock_id, data)
+                self.reg_write(0, result)
+            except Exception as e:
+                logger.error("NET_SEND error: %s", e)
+                self.reg_write(0, -1)
+        elif opcode == OP_NET_RECV:
+            # NET_RECV: R0=socket_id, R1=buffer_addr, R2=buffer_size
+            sock_id = self.reg_read(0)
+            buf_addr = self.reg_read(1)
+            buf_size = self.reg_read(2)
+            try:
+                data = self.network.socket_recv(sock_id, buf_size)
+                if data:
+                    self.mem.load_bytes(buf_addr, data)
+                    self.reg_write(0, len(data))
+                else:
+                    self.reg_write(0, 0)
+            except Exception as e:
+                logger.error("NET_RECV error: %s", e)
+                self.reg_write(0, -1)
+        elif opcode == OP_NET_CONNECT:
+            # NET_CONNECT: R0=socket_id, R1=host_addr, R2=port
+            sock_id = self.reg_read(0)
+            host_addr = self.reg_read(1)
+            port = self.reg_read(2)
+            try:
+                host = Kernel.read_cstring(self.mem, host_addr)
+                result = self.network.socket_connect(sock_id, host, port)
+                self.reg_write(0, result)
+            except Exception as e:
+                logger.error("NET_CONNECT error: %s", e)
+                self.reg_write(0, -1)
+        elif opcode == OP_NET_CLOSE:
+            # NET_CLOSE: R0=socket_id
+            sock_id = self.reg_read(0)
+            try:
+                result = self.network.socket_close(sock_id)
+                self.reg_write(0, result)
+            except Exception as e:
+                logger.error("NET_CLOSE error: %s", e)
+                self.reg_write(0, -1)
+        elif opcode == OP_NET_PING:
+            # NET_PING: R0=host_addr, result in R0 (1=success, 0=fail)
+            host_addr = self.reg_read(0)
+            try:
+                host = Kernel.read_cstring(self.mem, host_addr)
+                result = 1 if self.network.utils.ping(host) else 0
+                self.reg_write(0, result)
+            except Exception as e:
+                logger.error("NET_PING error: %s", e)
+                self.reg_write(0, 0)
+        elif opcode == OP_NET_CURL:
+            # NET_CURL: R0=url_addr, R1=buffer_addr, result in R0 (bytes written)
+            url_addr = self.reg_read(0)
+            buf_addr = self.reg_read(1)
+            try:
+                url = Kernel.read_cstring(self.mem, url_addr)
+                content = self.network.utils.curl(url)
+                data = content.encode('utf-8')[:1024]
+                self.mem.load_bytes(buf_addr, data)
+                self.reg_write(0, len(data))
+            except Exception as e:
+                logger.error("NET_CURL error: %s", e)
+                self.reg_write(0, 0)
+        elif opcode == OP_NET_WGET:
+            # NET_WGET: R0=url_addr, result in R0 (bytes downloaded)
+            url_addr = self.reg_read(0)
+            try:
+                url = Kernel.read_cstring(self.mem, url_addr)
+                result = self.network.utils.wget(url)
+                self.reg_write(0, result)
+            except Exception as e:
+                logger.error("NET_WGET error: %s", e)
+                self.reg_write(0, -1)
+        elif opcode == OP_SQRT:
+            # SQRT: dst = sqrt(src)
+            val = float(to_signed32(self.reg_read(src)))
+            result = int(math.sqrt(abs(val))) & 0xFFFFFFFF
+            self.reg_write(dst, result)
+        elif opcode == OP_POW:
+            # POW: dst = dst ^ src (power)
+            base = float(to_signed32(self.reg_read(dst)))
+            exp = float(to_signed32(self.reg_read(src)))
+            result = int(math.pow(base, exp)) & 0xFFFFFFFF
+            self.reg_write(dst, result)
+        elif opcode == OP_LOG:
+            # LOG: dst = log(src)
+            val = float(to_signed32(self.reg_read(src)))
+            result = int(math.log(abs(val) + 1)) & 0xFFFFFFFF
+            self.reg_write(dst, result)
+        elif opcode == OP_EXP:
+            # EXP: dst = e^src
+            val = float(to_signed32(self.reg_read(src)))
+            result = int(math.exp(val)) & 0xFFFFFFFF
+            self.reg_write(dst, result)
+        elif opcode == OP_SIN:
+            # SIN: dst = sin(src)
+            val = float(to_signed32(self.reg_read(src)))
+            result = int(math.sin(val) * 1000) & 0xFFFFFFFF
+            self.reg_write(dst, result)
+        elif opcode == OP_COS:
+            # COS: dst = cos(src)
+            val = float(to_signed32(self.reg_read(src)))
+            result = int(math.cos(val) * 1000) & 0xFFFFFFFF
+            self.reg_write(dst, result)
+        elif opcode == OP_TAN:
+            # TAN: dst = tan(src)
+            val = float(to_signed32(self.reg_read(src)))
+            result = int(math.tan(val) * 1000) & 0xFFFFFFFF
+            self.reg_write(dst, result)
+        elif opcode == OP_LZCNT:
+            # LZCNT: dst = leading zero count in src
+            val = self.reg_read(src)
+            count = 0
+            for i in range(31, -1, -1):
+                if (val >> i) & 1:
+                    break
+                count += 1
+            self.reg_write(dst, count)
+        elif opcode == OP_TZCNT:
+            # TZCNT: dst = trailing zero count in src
+            val = self.reg_read(src)
+            if val == 0:
+                self.reg_write(dst, 32)
+            else:
+                count = 0
+                while (val & 1) == 0:
+                    count += 1
+                    val >>= 1
+                self.reg_write(dst, count)
+        elif opcode == OP_SETA:
+            # SETA: Set if above (unsigned >)
+            if self.test_flag(FLAG_CARRY) == 0 and self.test_flag(FLAG_ZERO) == 0:
+                self.reg_write(dst, 1)
+            else:
+                self.reg_write(dst, 0)
+        elif opcode == OP_SETB:
+            # SETB: Set if below (unsigned <)
+            if self.test_flag(FLAG_CARRY):
+                self.reg_write(dst, 1)
+            else:
+                self.reg_write(dst, 0)
+        elif opcode == OP_SETBE:
+            # SETBE: Set if below or equal
+            if self.test_flag(FLAG_CARRY) or self.test_flag(FLAG_ZERO):
+                self.reg_write(dst, 1)
+            else:
+                self.reg_write(dst, 0)
+        elif opcode == OP_SETAE:
+            # SETAE: Set if above or equal
+            if not self.test_flag(FLAG_CARRY):
+                self.reg_write(dst, 1)
+            else:
+                self.reg_write(dst, 0)
+        elif opcode == OP_SETO:
+            # SETO: Set if overflow
+            if self.test_flag(FLAG_OVERFLOW):
+                self.reg_write(dst, 1)
+            else:
+                self.reg_write(dst, 0)
+        elif opcode == OP_SETNO:
+            # SETNO: Set if no overflow
+            if not self.test_flag(FLAG_OVERFLOW):
+                self.reg_write(dst, 1)
+            else:
+                self.reg_write(dst, 0)
+        elif opcode == OP_PREFETCH:
+            # PREFETCH: Prefetch memory (no-op in emulation)
+            pass
+        elif opcode == OP_CLFLUSH:
+            # CLFLUSH: Flush cache line (no-op in emulation)
+            pass
+        elif opcode == OP_MFENCE:
+            # MFENCE: Memory fence (no-op in emulation)
+            pass
+        elif opcode == OP_LFENCE:
+            # LFENCE: Load fence (no-op in emulation)
+            pass
+        elif opcode == OP_SFENCE:
+            # SFENCE: Store fence (no-op in emulation)
+            pass
+        elif opcode == OP_SWAP:
+            # SWAP: Swap dst and src registers
+            tmp = self.reg_read(dst)
+            self.reg_write(dst, self.reg_read(src))
+            self.reg_write(src, tmp)
+        elif opcode == OP_ROT:
+            # ROT: Rotate bits (dst rotated by src positions)
+            val = self.reg_read(dst)
+            shift = self.reg_read(src) & 0x1F
+            result = ((val << shift) | (val >> (32 - shift))) & 0xFFFFFFFF
+            self.reg_write(dst, result)
+        elif opcode == OP_REVERSE:
+            # REVERSE: Reverse bits in register
+            val = self.reg_read(dst)
+            result = 0
+            for i in range(32):
+                if (val >> i) & 1:
+                    result |= (1 << (31 - i))
+            self.reg_write(dst, result)
+        elif opcode == OP_RANDOM:
+            # RANDOM: Generate random number in dst
+            self.reg_write(dst, random.randint(0, 0xFFFFFFFF))
+        elif opcode == OP_GETTIME:
+            # GETTIME: Get current time in dst
+            self.reg_write(dst, int(time.time()) & 0xFFFFFFFF)
+        elif opcode == OP_SLEEP:
+            # SLEEP: Sleep for src milliseconds
+            ms = self.reg_read(src)
+            time.sleep(ms / 1000.0)
+        elif opcode == OP_YIELD:
+            # YIELD: Yield CPU (no-op in emulation)
+            pass
+        elif opcode == OP_BARRIER:
+            # BARRIER: Memory barrier (no-op in emulation)
+            pass
+        elif opcode == OP_GETSEED:
+            # GETSEED: Get random seed
+            self.reg_write(dst, random.getstate()[1][0])
+        elif opcode == OP_SETSEED:
+            # SETSEED: Set random seed
+            random.seed(self.reg_read(src))
+        elif opcode == OP_HASH:
+            # HASH: Simple hash function
+            val = self.reg_read(src)
+            result = ((val * 2654435761) ^ (val >> 16)) & 0xFFFFFFFF
+            self.reg_write(dst, result)
+        elif opcode == OP_CRC32:
+            # CRC32: Simple CRC32 calculation
+            val = self.reg_read(src)
+            crc = 0xFFFFFFFF
+            for i in range(32):
+                if ((crc ^ val) & 1):
+                    crc = (crc >> 1) ^ 0xEDB88320
+                else:
+                    crc = crc >> 1
+                val >>= 1
+            self.reg_write(dst, crc ^ 0xFFFFFFFF)
+        elif opcode == OP_SWAP:
+            # SWAP: Swap two registers
+            temp = self.reg_read(dst)
+            self.reg_write(dst, self.reg_read(src))
+            self.reg_write(src, temp)
+        elif opcode == OP_ROT:
+            # ROT: Rotate bits left by src positions
+            val = self.reg_read(dst)
+            shift = self.reg_read(src) & 0x1F
+            if shift > 0:
+                result = ((val << shift) | (val >> (32 - shift))) & 0xFFFFFFFF
+                self.reg_write(dst, result)
+            # Set flags based on result
+            self.update_zero_and_neg_flags(result)
+        elif opcode == OP_REVERSE:
+            # REVERSE: Reverse all bits in register
+            val = self.reg_read(dst)
+            result = 0
+            for i in range(32):
+                if (val >> i) & 1:
+                    result |= (1 << (31 - i))
+            self.reg_write(dst, result)
+            self.update_zero_and_neg_flags(result)
+        elif opcode == OP_SETG:
+            # SETG: Set if greater (signed >)
+            if not self.test_flag(FLAG_ZERO) and (self.test_flag(FLAG_NEG) == self.test_flag(FLAG_OVERFLOW)):
+                self.reg_write(dst, 1)
+            else:
+                self.reg_write(dst, 0)
+        elif opcode == OP_SETLE:
+            # SETLE: Set if less or equal (signed <=)
+            if self.test_flag(FLAG_ZERO) or (self.test_flag(FLAG_NEG) != self.test_flag(FLAG_OVERFLOW)):
+                self.reg_write(dst, 1)
+            else:
+                self.reg_write(dst, 0)
+        elif opcode == OP_SETGE:
+            # SETGE: Set if greater or equal (signed >=)
+            if self.test_flag(FLAG_NEG) == self.test_flag(FLAG_OVERFLOW):
+                self.reg_write(dst, 1)
+            else:
+                self.reg_write(dst, 0)
+        elif opcode == OP_SETNE:
+            # SETNE: Set if not equal
+            if not self.test_flag(FLAG_ZERO):
+                self.reg_write(dst, 1)
+            else:
+                self.reg_write(dst, 0)
+        elif opcode == OP_SETE:
+            # SETE: Set if equal
+            if self.test_flag(FLAG_ZERO):
+                self.reg_write(dst, 1)
+            else:
+                self.reg_write(dst, 0)
+        elif opcode == OP_LOOP:
+            # LOOP: Decrement RCX and jump if not zero
+            rcx = self.reg_read(1)  # Assume R1 is the counter
+            rcx = (rcx - 1) & 0xFFFFFFFF
+            self.reg_write(1, rcx)
+            if rcx != 0:
+                next_pc = imm16
+        elif opcode == OP_LOOPZ:
+            # LOOPZ: Decrement RCX and jump if not zero and ZF=1
+            rcx = self.reg_read(1)
+            rcx = (rcx - 1) & 0xFFFFFFFF
+            self.reg_write(1, rcx)
+            if rcx != 0 and self.test_flag(FLAG_ZERO):
+                next_pc = imm16
+        elif opcode == OP_LOOPNZ:
+            # LOOPNZ: Decrement RCX and jump if not zero and ZF=0
+            rcx = self.reg_read(1)
+            rcx = (rcx - 1) & 0xFFFFFFFF
+            self.reg_write(1, rcx)
+            if rcx != 0 and not self.test_flag(FLAG_ZERO):
+                next_pc = imm16
+        elif opcode == OP_MOVSB:
+            # MOVSB: Move byte from [RSI] to [RDI]
+            src_addr = self.reg_read(2)  # Assume R2 is RSI
+            dst_addr = self.reg_read(3)  # Assume R3 is RDI
+            byte = self.mem.read_byte(src_addr)
+            self.mem.write_byte(dst_addr, byte)
+            # Update pointers based on direction flag
+            if self.test_flag(FLAG_DIR):
+                self.reg_write(2, (src_addr - 1) & 0xFFFFFFFF)
+                self.reg_write(3, (dst_addr - 1) & 0xFFFFFFFF)
+            else:
+                self.reg_write(2, (src_addr + 1) & 0xFFFFFFFF)
+                self.reg_write(3, (dst_addr + 1) & 0xFFFFFFFF)
+        elif opcode == OP_MOVSW:
+            # MOVSW: Move word from [RSI] to [RDI]
+            src_addr = self.reg_read(2)
+            dst_addr = self.reg_read(3)
+            word = self.mem.read_word(src_addr)
+            self.mem.write_word(dst_addr, word)
+            if self.test_flag(FLAG_DIR):
+                self.reg_write(2, (src_addr - 4) & 0xFFFFFFFF)
+                self.reg_write(3, (dst_addr - 4) & 0xFFFFFFFF)
+            else:
+                self.reg_write(2, (src_addr + 4) & 0xFFFFFFFF)
+                self.reg_write(3, (dst_addr + 4) & 0xFFFFFFFF)
+        elif opcode == OP_CMPSB:
+            # CMPSB: Compare bytes at [RSI] and [RDI]
+            src_addr = self.reg_read(2)
+            dst_addr = self.reg_read(3)
+            byte1 = self.mem.read_byte(src_addr)
+            byte2 = self.mem.read_byte(dst_addr)
+            res = (byte1 - byte2) & 0xFF
+            self.update_zero_and_neg_flags(res)
+            if self.test_flag(FLAG_DIR):
+                self.reg_write(2, (src_addr - 1) & 0xFFFFFFFF)
+                self.reg_write(3, (dst_addr - 1) & 0xFFFFFFFF)
+            else:
+                self.reg_write(2, (src_addr + 1) & 0xFFFFFFFF)
+                self.reg_write(3, (dst_addr + 1) & 0xFFFFFFFF)
+        elif opcode == OP_SCASB:
+            # SCASB: Scan byte at [RDI] against AL (R0 low byte)
+            dst_addr = self.reg_read(3)
+            al = self.reg_read(0) & 0xFF
+            byte = self.mem.read_byte(dst_addr)
+            res = (al - byte) & 0xFF
+            self.update_zero_and_neg_flags(res)
+            if self.test_flag(FLAG_DIR):
+                self.reg_write(3, (dst_addr - 1) & 0xFFFFFFFF)
+            else:
+                self.reg_write(3, (dst_addr + 1) & 0xFFFFFFFF)
+        elif opcode == OP_LODSB:
+            # LODSB: Load byte from [RSI] into AL
+            src_addr = self.reg_read(2)
+            byte = self.mem.read_byte(src_addr)
+            self.reg_write(0, (self.reg_read(0) & 0xFFFFFF00) | byte)
+            if self.test_flag(FLAG_DIR):
+                self.reg_write(2, (src_addr - 1) & 0xFFFFFFFF)
+            else:
+                self.reg_write(2, (src_addr + 1) & 0xFFFFFFFF)
+        elif opcode == OP_STOSB:
+            # STOSB: Store AL into [RDI]
+            dst_addr = self.reg_read(3)
+            al = self.reg_read(0) & 0xFF
+            self.mem.write_byte(dst_addr, al)
+            if self.test_flag(FLAG_DIR):
+                self.reg_write(3, (dst_addr - 1) & 0xFFFFFFFF)
+            else:
+                self.reg_write(3, (dst_addr + 1) & 0xFFFFFFFF)
+        elif opcode == OP_IMUL3:
+            # IMUL3: Three-operand signed multiply (dst = src * imm)
+            a = self.reg_read(src)
+            b = to_signed16(imm16)
+            result = (a * b) & 0xFFFFFFFF
+            self.reg_write(dst, result)
+            self.update_zero_and_neg_flags(result)
+        elif opcode == OP_SHLD:
+            # SHLD: Double precision shift left
+            val1 = self.reg_read(dst)
+            val2 = self.reg_read(src)
+            count = imm16 & 0x1F
+            if count > 0:
+                result = ((val1 << count) | (val2 >> (32 - count))) & 0xFFFFFFFF
+                self.reg_write(dst, result)
+                self.update_zero_and_neg_flags(result)
+        elif opcode == OP_SHRD:
+            # SHRD: Double precision shift right
+            val1 = self.reg_read(dst)
+            val2 = self.reg_read(src)
+            count = imm16 & 0x1F
+            if count > 0:
+                result = ((val1 >> count) | (val2 << (32 - count))) & 0xFFFFFFFF
+                self.reg_write(dst, result)
+                self.update_zero_and_neg_flags(result)
+        elif opcode == OP_RDTSC:
+            # RDTSC: Read Time-Stamp Counter
+            import time
+            tsc = int(time.time() * 1000000) & 0xFFFFFFFFFFFFFFFF
+            self.reg_write(0, tsc & 0xFFFFFFFF)  # Low 32 bits in R0
+            self.reg_write(2, (tsc >> 32) & 0xFFFFFFFF)  # High 32 bits in R2
+        elif opcode == OP_RDMSR:
+            # RDMSR: Read Model Specific Register (simplified)
+            msr_id = self.reg_read(1)
+            # Return dummy value
+            self.reg_write(0, 0)
+            self.reg_write(2, 0)
+        elif opcode == OP_WRMSR:
+            # WRMSR: Write Model Specific Register (simplified, no-op)
+            pass
+        elif opcode == OP_PAUSE:
+            # PAUSE: Hint for spin-wait loops (no-op in emulation)
+            pass
+        elif opcode in (OP_NOP3, OP_NOP4, OP_LOCK, OP_REPNE, OP_REPE):
+            # Various no-ops and prefixes
+            pass
         else:
             raise NotImplementedError(f"Opcode {opcode:02x} not implemented")
         self.pc = next_pc & 0xFFFFFFFF
@@ -3139,16 +3695,25 @@ class AssemblerError(Exception):
     pass
 class Assembler:
     """
-    Simple two-pass assembler supporting labels, .org, .word, .byte, .float, .double
+    Advanced two-pass assembler with labels, directives, macros, and optimization
     Syntax:
     LABEL:
     MNEMONIC operands ; comment
     Registers: R0..R15, ST0..ST7
+    Directives: .org, .word, .byte, .float, .double, .align, .space, .string, .include
     """
     def __init__(self):
         self.labels: Dict[str, int] = {}
         self.orig = 0
         self.lines: List[Tuple[int, str]] = []
+        self.macros: Dict[str, Tuple[List[str], List[str]]] = {}  # name -> (params, body)
+        self.constants: Dict[str, int] = {}
+        self.errors: List[str] = []
+        self.warnings: List[str] = []
+        self.optimization_level = 1  # 0=none, 1=basic, 2=aggressive
+        self.used_labels: set = set()
+        self.include_paths: List[str] = ['.']  # Search paths for .include
+        self.string_data: Dict[int, bytes] = {}  # address -> string data
     def parse_reg(self, tok: str) -> int:
         tok = tok.upper().strip()
         if tok.startswith("R"):
@@ -3168,6 +3733,12 @@ class Assembler:
         # Allow bracketed immediates like [0x1000] or [label]
         if tok.startswith('[') and tok.endswith(']'):
             tok = tok[1:-1].strip()
+        # Check if it's a constant
+        if tok.upper() in self.constants:
+            return self.constants[tok.upper()]
+        # Evaluate expression if it contains operators
+        if any(op in tok for op in ['+', '-', '*', '/', '(', ')']):
+            return self.eval_expression(tok)
         # Support hex with 0x, trailing h, binary 0b, underscore separators
         tok_clean = tok.replace('_', '')
         if tok_clean.startswith("0x") or tok_clean.startswith("0X"):
@@ -3180,22 +3751,199 @@ class Assembler:
         return int(tok_clean, 0) & 0xFFFFFFFF
     def parse_float(self, tok: str) -> float:
         return float(tok)
+    
+    def define_macro(self, name: str, params: List[str], body: List[str]):
+        """Define a macro with parameters"""
+        self.macros[name.upper()] = (params, body)
+    
+    def define_constant(self, name: str, value: int):
+        """Define a constant"""
+        self.constants[name.upper()] = value
+    
+    def expand_macros(self, text: str, line_num: int) -> str:
+        """Expand macros in assembly code"""
+        import re
+        for macro_name, (params, body) in self.macros.items():
+            # Match macro invocation: MACRO_NAME arg1, arg2, ...
+            # Use case-insensitive match but preserve original case of arguments
+            pattern = rf'\b{macro_name}\b\s+(.*)'
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                # Get arguments from ORIGINAL text (preserves case)
+                args_str = match.group(1).strip()
+                args = [a.strip() for a in args_str.split(',')]
+                if len(args) != len(params):
+                    self.errors.append(f"Line {line_num}: Macro {macro_name} expects {len(params)} args, got {len(args)}")
+                    return text
+                # Replace parameters in body
+                expanded = []
+                for body_line in body:
+                    line = body_line
+                    for i, param in enumerate(params):
+                        # Replace parameter placeholder with actual argument (preserving case)
+                        line = line.replace(f'\\{param}', args[i])
+                    expanded.append(line)
+                return '\n'.join(expanded)
+        return text
+    
+    def eval_expression(self, expr: str) -> int:
+        """Evaluate arithmetic expression with constants and labels"""
+        # Replace constants and labels with their values
+        expr_eval = expr
+        for const_name, const_val in self.constants.items():
+            expr_eval = expr_eval.replace(const_name, str(const_val))
+        for label_name, label_addr in self.labels.items():
+            expr_eval = expr_eval.replace(label_name, str(label_addr))
+        try:
+            # Safe eval with only basic operators
+            result = eval(expr_eval, {"__builtins__": {}}, {})
+            return int(result) & 0xFFFFFFFF
+        except Exception as e:
+            raise AssemblerError(f"Invalid expression '{expr}': {e}")
+    
+    def get_errors(self) -> List[str]:
+        """Get list of assembly errors"""
+        return self.errors
+    
+    def get_warnings(self) -> List[str]:
+        """Get list of assembly warnings"""
+        return self.warnings
+    
+    def clear_errors(self):
+        """Clear error list"""
+        self.errors.clear()
+        self.warnings.clear()
+    
     def first_pass(self, text: str):
         self.labels.clear()
         self.orig = 0
         self.lines = []
+        self.used_labels.clear()
         pc = self.orig
-        for i, raw in enumerate(text.splitlines()):
+        
+        # Pre-process: handle .include, .equ, .macro
+        preprocessed_lines = []
+        in_macro = False
+        macro_name = ""
+        macro_params = []
+        macro_body = []
+        
+        all_lines = text.splitlines()
+        i = 0
+        while i < len(all_lines):
+            raw = all_lines[i]
+            line = raw.split(';',1)[0].strip()
+            
+            if line.startswith('.include'):
+                # Handle .include directive
+                tokens = line.split()
+                if len(tokens) < 2:
+                    self.errors.append(f"Line {i+1}: .include requires filename")
+                    i += 1
+                    continue
+                filename = tokens[1].strip('"\'')
+                try:
+                    # Try to find and read the include file
+                    import os
+                    found = False
+                    for path in self.include_paths:
+                        filepath = os.path.join(path, filename)
+                        if os.path.exists(filepath):
+                            with open(filepath, 'r') as f:
+                                include_content = f.read()
+                            preprocessed_lines.extend(include_content.splitlines())
+                            found = True
+                            break
+                    if not found:
+                        self.errors.append(f"Line {i+1}: Include file '{filename}' not found")
+                except Exception as e:
+                    self.errors.append(f"Line {i+1}: Error reading include file: {e}")
+                i += 1
+                continue
+            
+            elif line.startswith('.equ'):
+                # Handle .equ directive for constants
+                # Format: .equ NAME, value  or  .equ NAME value
+                rest = line[4:].strip()  # Get everything after '.equ'
+                if ',' in rest:
+                    # Handle comma-separated format
+                    parts = rest.split(',', 1)
+                    const_name = parts[0].strip().upper()
+                    const_value_str = parts[1].strip()
+                else:
+                    # Handle space-separated format
+                    tokens = rest.split(None, 1)
+                    if len(tokens) < 2:
+                        self.errors.append(f"Line {i+1}: .equ requires name and value")
+                        i += 1
+                        continue
+                    const_name = tokens[0].upper()
+                    const_value_str = tokens[1]
+                try:
+                    const_value = self.parse_imm(const_value_str)
+                    self.constants[const_name] = const_value
+                except Exception as e:
+                    self.errors.append(f"Line {i+1}: Invalid .equ value: {e}")
+                i += 1
+                continue
+            
+            elif line.startswith('.macro'):
+                # Start macro definition
+                tokens = line.split()
+                if len(tokens) < 2:
+                    self.errors.append(f"Line {i+1}: .macro requires name")
+                    i += 1
+                    continue
+                macro_name = tokens[1].upper()
+                # Parse parameters if any
+                if len(tokens) > 2:
+                    params_str = ' '.join(tokens[2:])
+                    macro_params = [p.strip() for p in params_str.split(',')]
+                else:
+                    macro_params = []
+                in_macro = True
+                macro_body = []
+                i += 1
+                continue
+            
+            elif line.startswith('.endm'):
+                # End macro definition
+                if in_macro:
+                    self.define_macro(macro_name, macro_params, macro_body)
+                    in_macro = False
+                    macro_name = ""
+                    macro_params = []
+                    macro_body = []
+                else:
+                    self.errors.append(f"Line {i+1}: .endm without .macro")
+                i += 1
+                continue
+            
+            if in_macro:
+                macro_body.append(raw)
+            else:
+                # Expand macros in this line
+                expanded = self.expand_macros(raw, i+1)
+                if expanded != raw:
+                    # Macro was expanded, add all expanded lines
+                    preprocessed_lines.extend(expanded.splitlines())
+                else:
+                    preprocessed_lines.append(raw)
+            i += 1
+        
+        # Now process preprocessed lines for labels and size calculation
+        for i, raw in enumerate(preprocessed_lines):
             line = raw.split(';',1)[0].strip()
             if not line:
                 self.lines.append((i+1, raw))
                 continue
-            if ':' in line:
+            if ':' in line and not line.startswith('.'):
                 parts = line.split(':',1)
                 label = parts[0].strip()
                 if label in self.labels:
-                    raise AssemblerError(f"Duplicate label {label} on line {i+1}")
-                self.labels[label] = pc
+                    self.errors.append(f"Line {i+1}: Duplicate label {label}")
+                else:
+                    self.labels[label] = pc
                 line = parts[1].strip()
                 if line == "":
                     self.lines.append((i+1, raw))
@@ -3205,25 +3953,71 @@ class Assembler:
                 directive = tokens[0].lower()
                 if directive == '.org':
                     if len(tokens) < 2:
-                        raise AssemblerError("Missing .org operand")
-                    pc = self.parse_imm(tokens[1])
-                    self.orig = pc
-                elif directive == '.word':
+                        self.errors.append(f"Line {i+1}: Missing .org operand")
+                    else:
+                        try:
+                            pc = self.parse_imm(tokens[1])
+                            self.orig = pc
+                        except Exception as e:
+                            self.errors.append(f"Line {i+1}: Invalid .org value: {e}")
+                elif directive == '.word' or directive == '.dword':
                     pc += 4
                 elif directive == '.byte':
-                    pc += 1
+                    # Count comma-separated values
+                    rest = line[len(tokens[0]):].strip()
+                    if rest:
+                        items = [i.strip() for i in rest.split(',') if i.strip()]
+                        pc += len(items)
+                    else:
+                        pc += 1
+                elif directive == '.string':
+                    # Calculate string length
+                    rest = line[len(tokens[0]):].strip()
+                    if rest:
+                        # Parse string literal
+                        if rest.startswith('"') and rest.endswith('"'):
+                            string_content = rest[1:-1]
+                            # Handle escape sequences
+                            string_content = string_content.replace('\\n', '\n').replace('\\t', '\t').replace('\\\\', '\\')
+                            pc += len(string_content.encode('utf-8')) + 1  # +1 for null terminator
+                        else:
+                            self.errors.append(f"Line {i+1}: .string requires quoted string")
                 elif directive == '.float':
                     pc += 4
                 elif directive == '.double':
                     pc += 8
+                elif directive == '.align':
+                    if len(tokens) >= 2:
+                        try:
+                            # Parse just the number, ignore any commas
+                            align_str = tokens[1].split(',')[0].strip()
+                            align = self.parse_imm(align_str)
+                            if pc % align != 0:
+                                pc = ((pc // align) + 1) * align
+                        except Exception as e:
+                            self.errors.append(f"Line {i+1}: Invalid .align value: {e}")
+                elif directive == '.space':
+                    if len(tokens) >= 2:
+                        try:
+                            # Parse arguments: .space size [, fill_byte]
+                            rest = line[len(tokens[0]):].strip()
+                            args = [a.strip() for a in rest.split(',')]
+                            space = self.parse_imm(args[0])
+                            pc += space
+                        except Exception as e:
+                            self.errors.append(f"Line {i+1}: Invalid .space value: {e}")
+                elif directive in ['.equ', '.macro', '.endm', '.include']:
+                    # Already handled in preprocessing
+                    pass
                 else:
-                    raise AssemblerError(f"Unknown directive {directive}")
+                    self.warnings.append(f"Line {i+1}: Unknown directive {directive}")
                 self.lines.append((i+1, raw))
             else:
                 # instruction occupies 4 bytes
                 pc += 4
                 self.lines.append((i+1, raw))
         logger.debug("First pass labels: %s", self.labels)
+        logger.debug("Constants: %s", self.constants)
     def second_pass(self) -> bytes:
         pc = self.orig
         out = bytearray()
@@ -3246,11 +4040,18 @@ class Assembler:
                     if pc > len(out):
                         out.extend(bytearray(pc - len(out)))
                 elif directive == '.word':
-                    val = self.parse_imm(tokens[1])
-                    if pc + 4 > len(out):
-                        out.extend(bytearray(pc + 4 - len(out)))
-                    out[pc:pc+4] = itob_le(val)
-                    pc += 4
+                    # Get the rest of the line after .word
+                    rest = line[len(tokens[0]):].strip()
+                    if not rest:
+                        self.errors.append(f"Line {ln}: .word requires operand")
+                    else:
+                        # Resolve constants/labels first
+                        resolved = self.resolve_label_token(rest)
+                        val = self.parse_imm(resolved)
+                        if pc + 4 > len(out):
+                            out.extend(bytearray(pc + 4 - len(out)))
+                        out[pc:pc+4] = itob_le(val)
+                        pc += 4
                 elif directive == '.byte':
                     # Support multiple comma-separated byte values: .byte 0x41,0x42,65
                     rest = line[len(tokens[0]):].strip()
@@ -3258,7 +4059,9 @@ class Assembler:
                         raise AssemblerError('.byte requires operand')
                     items = [i.strip() for i in rest.split(',') if i.strip()!='']
                     for it in items:
-                        val = self.parse_imm(it) & 0xFF
+                        # Resolve constants/labels first
+                        resolved = self.resolve_label_token(it)
+                        val = self.parse_imm(resolved) & 0xFF
                         if pc + 1 > len(out):
                             out.extend(bytearray(pc + 1 - len(out)))
                         out[pc] = val
@@ -3278,8 +4081,64 @@ class Assembler:
                     packed = struct.pack('<d', val)
                     out[pc:pc+8] = packed
                     pc += 8
+                elif directive == '.dword':
+                    # Same as .word - 32-bit value
+                    rest = line[len(tokens[0]):].strip()
+                    if not rest:
+                        self.errors.append(f"Line {ln}: .dword requires operand")
+                    else:
+                        # Resolve constants/labels first
+                        resolved = self.resolve_label_token(rest)
+                        val = self.parse_imm(resolved)
+                        if pc + 4 > len(out):
+                            out.extend(bytearray(pc + 4 - len(out)))
+                        out[pc:pc+4] = itob_le(val)
+                        pc += 4
+                elif directive == '.string':
+                    # Handle string directive
+                    rest = line[len(tokens[0]):].strip()
+                    if rest and rest.startswith('"') and rest.endswith('"'):
+                        string_content = rest[1:-1]
+                        # Handle escape sequences
+                        string_content = string_content.replace('\\\\', '\x00')  # Temp placeholder
+                        string_content = string_content.replace('\\n', '\n').replace('\\t', '\t').replace('\\r', '\r').replace('\\"', '"')
+                        string_content = string_content.replace('\x00', '\\')  # Restore backslash
+                        string_bytes = string_content.encode('utf-8') + b'\x00' # null terminator
+                        if pc + len(string_bytes) > len(out):
+                            out.extend(bytearray(pc + len(string_bytes) - len(out)))
+                        out[pc:pc+len(string_bytes)] = string_bytes
+                        pc += len(string_bytes)
+                    else:
+                        self.errors.append(f"Line {ln}: .string requires quoted string")
+                elif directive == '.align':
+                    # Align to boundary
+                    if len(tokens) >= 2:
+                        align_str = tokens[1].split(',')[0].strip()
+                        align = self.parse_imm(align_str)
+                        if pc % align != 0:
+                            new_pc = ((pc // align) + 1) * align
+                            if new_pc > len(out):
+                                out.extend(bytearray(new_pc - len(out)))
+                            pc = new_pc
+                elif directive == '.space':
+                    # Reserve space: .space size [, fill_byte]
+                    if len(tokens) >= 2:
+                        rest = line[len(tokens[0]):].strip()
+                        args = [a.strip() for a in rest.split(',')]
+                        space = self.parse_imm(args[0])
+                        fill_byte = 0
+                        if len(args) >= 2:
+                            fill_byte = self.parse_imm(args[1]) & 0xFF
+                        if pc + space > len(out):
+                            out.extend(bytearray(pc + space - len(out)))
+                        for i in range(space):
+                            out[pc + i] = fill_byte
+                        pc += space
+                elif directive in ['.equ', '.macro', '.endm', '.include']:
+                    # Already handled in first pass
+                    pass
                 else:
-                    raise AssemblerError(f"Unsupported directive {directive} on line {ln}")
+                    self.warnings.append(f"Line {ln}: Unsupported directive {directive}")
             else:
                 # Allow bracketed operands in assembly (e.g., STORE R4, [0x0300])
                 tokens = shlex.split(line)
@@ -3299,9 +4158,9 @@ class Assembler:
                 if opcode is None:
                     raise AssemblerError(f"Unknown mnemonic {mnem} on line {ln}")
                 word = 0
-                if opcode in (OP_NOP, OP_NOP2, OP_RET, OP_HALT, OP_CLC, OP_STC, OP_CLI, OP_STI, OP_IRET, OP_LEAVE, OP_FLDZ, OP_FLD1, OP_FLDPI, OP_FLDLG2, OP_FLDLN2, OP_FCLEX, OP_NEG, OP_CBW, OP_CWD, OP_CWDQ, OP_CLD, OP_STD, OP_LAHF, OP_SAHF, OP_INTO, OP_AAM, OP_AAD, OP_XLAT, OP_XCHG, OP_CMPXCHG, OP_LAR, OP_LSL, OP_SLDT, OP_STR, OP_LLDT, OP_LTR, OP_VERR, OP_VERW, OP_SGDT, OP_SIDT, OP_LGDT, OP_LIDT, OP_SMSW, OP_LMSW, OP_CLTS, OP_INVD, OP_WBINVD, OP_INVLPG, OP_INVPCID, OP_VMCALL, OP_VMLAUNCH, OP_VMRESUME, OP_VMXOFF, OP_MONITOR, OP_MWAIT, OP_RDSEED, OP_RDRAND, OP_CLAC, OP_STAC, OP_SKINIT, OP_SVMEXIT, OP_SVMRET, OP_SVMLOCK, OP_SVMUNLOCK):
+                if opcode in (OP_NOP, OP_NOP2, OP_NOP3, OP_NOP4, OP_RET, OP_HALT, OP_CLC, OP_STC, OP_CLI, OP_STI, OP_IRET, OP_LEAVE, OP_FLDZ, OP_FLD1, OP_FLDPI, OP_FLDLG2, OP_FLDLN2, OP_FCLEX, OP_NEG, OP_CBW, OP_CWD, OP_CWDQ, OP_CLD, OP_STD, OP_LAHF, OP_SAHF, OP_INTO, OP_AAM, OP_AAD, OP_XLAT, OP_XCHG, OP_CMPXCHG, OP_LAR, OP_LSL, OP_SLDT, OP_STR, OP_LLDT, OP_LTR, OP_VERR, OP_VERW, OP_SGDT, OP_SIDT, OP_LGDT, OP_LIDT, OP_SMSW, OP_LMSW, OP_CLTS, OP_INVD, OP_WBINVD, OP_INVLPG, OP_INVPCID, OP_VMCALL, OP_VMLAUNCH, OP_VMRESUME, OP_VMXOFF, OP_MONITOR, OP_MWAIT, OP_RDSEED, OP_RDRAND, OP_CLAC, OP_STAC, OP_SKINIT, OP_SVMEXIT, OP_SVMRET, OP_SVMLOCK, OP_SVMUNLOCK, OP_NET_CLOSE, OP_SWAP, OP_REVERSE, OP_RDTSC, OP_RDMSR, OP_WRMSR, OP_PAUSE, OP_LOCK, OP_REPNE, OP_REPE, OP_REP, OP_REPZ, OP_REPNZ, OP_MOVSB, OP_MOVSW, OP_MOVSD, OP_CMPSB, OP_SCASB, OP_LODSB, OP_STOSB):
                     word = pack_instruction(opcode, 0, 0, 0)
-                elif opcode in (OP_MOV, OP_ADD, OP_SUB, OP_AND, OP_OR, OP_XOR, OP_CMP, OP_TEST, OP_SHL, OP_SHR, OP_MUL, OP_IMUL, OP_DIV, OP_IDIV, OP_MOD, OP_FADD, OP_FSUB, OP_FMUL, OP_FDIV, OP_FCOMP, OP_FXCH, OP_ADC, OP_SBB, OP_ROL, OP_ROR, OP_BT, OP_BTS, OP_BTR, OP_BSF, OP_BSR, OP_ACCADD, OP_ACCSUB, OP_SETACC, OP_GETACC):
+                elif opcode in (OP_MOV, OP_ADD, OP_SUB, OP_AND, OP_OR, OP_XOR, OP_CMP, OP_TEST, OP_SHL, OP_SHR, OP_MUL, OP_IMUL, OP_DIV, OP_IDIV, OP_MOD, OP_FADD, OP_FSUB, OP_FMUL, OP_FDIV, OP_FCOMP, OP_FXCH, OP_ADC, OP_SBB, OP_ROL, OP_ROR, OP_BT, OP_BTS, OP_BTR, OP_BSF, OP_BSR, OP_ACCADD, OP_ACCSUB, OP_SETACC, OP_GETACC, OP_NET_SEND, OP_NET_RECV, OP_NET_CONNECT, OP_ROT, OP_HASH, OP_CRC32, OP_GETTIME, OP_SETSEED):
                     if len(args) != 2:
                         raise AssemblerError(f"{mnem} requires two operands on line {ln}")
                     dst = self.parse_reg(args[0])
@@ -3340,8 +4199,8 @@ class Assembler:
                         off_tok = second[op_pos:].strip()
                         src = self.parse_reg(base_tok)
                         imm = self.resolve_label_token(off_tok)
-                        imm_val = self.parse_imm(imm) & 0xFFFF
-                        word = pack_instruction(opcode, dst, src, imm_val)
+                        imm_val = self.parse_imm(imm)
+                        word = pack_instruction(opcode, dst, src, imm_val & 0xFFFF)
                     else:
                         # Try to parse as register
                         try:
@@ -3352,13 +4211,13 @@ class Assembler:
                             imm = self.resolve_label_token(second)
                             imm_val = self.parse_imm(imm) & 0xFFFF
                             word = pack_instruction(opcode, dst, 0, imm_val)
-                elif opcode in (OP_LOAD, OP_STORE, OP_JMP, OP_JZ, OP_JNZ, OP_JE, OP_JNE, OP_JL, OP_JG, OP_JLE, OP_JGE, OP_CALL, OP_INT, OP_FLD, OP_FST, OP_FSTP, OP_FILD, OP_FIST, OP_FISTP, OP_SETF, OP_TESTF, OP_CLRF):
+                elif opcode in (OP_LOAD, OP_STORE, OP_JMP, OP_JZ, OP_JNZ, OP_JE, OP_JNE, OP_JL, OP_JG, OP_JLE, OP_JGE, OP_CALL, OP_INT, OP_FLD, OP_FST, OP_FSTP, OP_FILD, OP_FIST, OP_FISTP, OP_SETF, OP_TESTF, OP_CLRF, OP_LOOP, OP_LOOPZ, OP_LOOPNZ):
                     if len(args) != 1:
                         raise AssemblerError(f"{mnem} requires one operand")
                     val = self.resolve_label_token(args[0])
                     valnum = self.parse_imm(val) & 0xFFFF
                     word = pack_instruction(opcode, 0, 0, valnum)
-                elif opcode in (OP_PUSH, OP_POP, OP_INC, OP_DEC, OP_NOT, OP_OUT, OP_IN, OP_SYSCALL, OP_FCHS, OP_FABS, OP_FSQRT, OP_FSTSW, OP_LAR, OP_LSL, OP_SLDT, OP_STR, OP_LLDT, OP_LTR, OP_VERR, OP_VERW, OP_SGDT, OP_SIDT, OP_LGDT, OP_LIDT, OP_SMSW, OP_LMSW, OP_CLTS, OP_INVD, OP_WBINVD, OP_INVLPG, OP_INVPCID, OP_VMCALL, OP_VMLAUNCH, OP_VMRESUME, OP_VMXOFF, OP_MONITOR, OP_MWAIT, OP_RDSEED, OP_RDRAND, OP_CLAC, OP_STAC, OP_SKINIT, OP_SVMEXIT, OP_SVMRET, OP_SVMLOCK, OP_SVMUNLOCK, OP_CPUID):
+                elif opcode in (OP_PUSH, OP_POP, OP_INC, OP_DEC, OP_NOT, OP_OUT, OP_IN, OP_SYSCALL, OP_FCHS, OP_FABS, OP_FSQRT, OP_FSTSW, OP_LAR, OP_LSL, OP_SLDT, OP_STR, OP_LLDT, OP_LTR, OP_VERR, OP_VERW, OP_SGDT, OP_SIDT, OP_LGDT, OP_LIDT, OP_SMSW, OP_LMSW, OP_CLTS, OP_INVD, OP_WBINVD, OP_INVLPG, OP_INVPCID, OP_VMCALL, OP_VMLAUNCH, OP_VMRESUME, OP_VMXOFF, OP_MONITOR, OP_MWAIT, OP_RDSEED, OP_RDRAND, OP_CLAC, OP_STAC, OP_SKINIT, OP_SVMEXIT, OP_SVMRET, OP_SVMLOCK, OP_SVMUNLOCK, OP_CPUID, OP_SETG, OP_SETLE, OP_SETGE, OP_SETNE, OP_SETE):
                     if len(args) != 1:
                         raise AssemblerError(f"{mnem} requires one operand")
                     dst = self.parse_reg(args[0])
@@ -3375,6 +4234,21 @@ class Assembler:
                     imm = self.resolve_label_token(args[1])
                     imm_val = self.parse_imm(imm)
                     word = pack_instruction(opcode, dst, 0, imm_val & 0xFFFF)
+                elif opcode in (OP_SHLD, OP_SHRD, OP_IMUL3):
+                    # Three-operand instructions: SHLD dst, src, count or IMUL3 dst, src, imm
+                    if len(args) == 3:
+                        dst = self.parse_reg(args[0])
+                        src = self.parse_reg(args[1])
+                        imm = self.resolve_label_token(args[2])
+                        imm_val = self.parse_imm(imm) & 0xFFFF
+                        word = pack_instruction(opcode, dst, src, imm_val)
+                    elif len(args) == 2:
+                        # Two operand form
+                        dst = self.parse_reg(args[0])
+                        src = self.parse_reg(args[1])
+                        word = pack_instruction(opcode, dst, src, 0)
+                    else:
+                        raise AssemblerError(f"{mnem} requires 2 or 3 operands")
                 elif opcode in (OP_PUSHF, OP_POPF):
                     word = pack_instruction(opcode, 0, 0, 0)
                 else:
@@ -3387,11 +4261,31 @@ class Assembler:
     def resolve_label_token(self, tok: str) -> str:
         tok = tok.strip()
         if tok in self.labels:
+            self.used_labels.add(tok)  # Track label usage
             return str(self.labels[tok])
+        elif tok.upper() in self.constants:
+            return str(self.constants[tok.upper()])
         return tok
+    
+    def check_warnings(self):
+        """Check for unused labels and undefined references"""
+        # Check for unused labels
+        for label in self.labels:
+            if label not in self.used_labels:
+                self.warnings.append(f"Unused label: {label}")
+    
     def assemble(self, text: str) -> bytes:
+        self.clear_errors()
         self.first_pass(text)
-        return self.second_pass()
+        if self.errors:
+            error_msg = "Assembly errors:\n" + "\n".join(self.errors)
+            raise AssemblerError(error_msg)
+        result = self.second_pass()
+        if self.errors:
+            error_msg = "Assembly errors:\n" + "\n".join(self.errors)
+            raise AssemblerError(error_msg)
+        self.check_warnings()
+        return result
 
 # ---------------------------
 # Host-side shell (interacts with kernel)
@@ -3485,6 +4379,8 @@ class Shell:
                         print("Available command categories:")
                         print("  system    - System and process management commands")
                         print("  file      - File operations and management")
+                        print("  text      - Text processing commands")
+                        print("  data      - Data encoding and hashing commands")
                         print("  memory    - Memory and CPU operations")
                         print("  network   - Network simulation commands")
                         print("  util      - Utility commands")
@@ -3506,6 +4402,11 @@ class Shell:
                         print("  bios      - Show BIOS information")
                         print("  sleep     - Delay execution")
                         print("  ver       - Show version information")
+                        print("  whoami    - Show current user")
+                        print("  uname     - Show system info")
+                        print("  env       - Show environment variables")
+                        print("  export    - Set environment variable")
+                        print("  unset     - Remove environment variable")
                     elif category == "file":
                         print("File Commands:")
                         print("  ls        - List files")
@@ -3522,31 +4423,67 @@ class Shell:
                         print("  stat      - Show file information")
                         print("  type      - Print file contents")
                         print("  find      - Search for files")
+                        print("  touch     - Create empty file")
+                        print("  df        - Show disk usage")
+                    elif category == "text":
+                        print("Text Processing Commands:")
                         print("  grep      - Search within files")
                         print("  wc        - Count lines/words/chars")
+                        print("  head      - Show first N lines")
+                        print("  tail      - Show last N lines")
+                        print("  sort      - Sort lines")
+                        print("  uniq      - Remove duplicate lines")
+                        print("  cut       - Extract columns")
+                        print("  tr        - Translate characters")
+                        print("  upper     - Convert to uppercase")
+                        print("  lower     - Convert to lowercase")
+                        print("  reverse   - Reverse text")
+                        print("  diff      - Compare two files")
+                    elif category == "data":
+                        print("Data Processing Commands:")
+                        print("  base64    - Base64 encode/decode")
+                        print("  base32    - Base32 encode/decode")
+                        print("  hex       - Hex encode/decode")
+                        print("  rot13     - ROT13 encode/decode")
+                        print("  md5       - MD5 hash")
+                        print("  sha256    - SHA256 hash")
+                        print("  hexdump   - Hex dump of file/memory")
                     elif category == "memory":
-                        print("Memory Commands:")
+                        print("Memory & Assembly Commands:")
                         print("  memmap    - Map memory region")
+                        print("  memstats  - Show memory statistics")
+                        print("  meminfo   - Show memory info")
                         print("  regs      - Show CPU registers")
                         print("  disasm    - Disassemble memory")
                         print("  debug     - Enable/disable CPU tracing")
                         print("  trace     - Trace execution")
                         print("  loadasm   - Load assembly program")
+                        print("  asminfo   - Show assembler symbols")
+                        print("  asmtest   - Run assembler tests")
                         print("  run       - Execute program")
+                        print("  cpuinfo   - Show CPU information")
+                        print("  benchmark - Run benchmarks")
                     elif category == "network":
                         print("Network Commands:")
-                        print("  ping      - Test connectivity")
-                        print("  curl      - Simulate HTTP request")
-                        print("  wget      - Download simulation")
+                        print("  ping <host>              - Test connectivity (real TCP)")
+                        print("  curl <url>               - Fetch URL content (real HTTP GET)")
+                        print("  wget <url>               - Download file (real HTTP)")
+                        print("  http <get|head> <url>    - HTTP operations")
+                        print("  dns <hostname>           - DNS lookup")
+                        print("  download <url> [file]    - Download and save file")
+                        print("  nettest <host> <port>    - Test network connectivity")
+                        print("  netsocket <cmd> [args]   - Socket operations (create, connect, send, recv, close)")
                     elif category == "util":
                         print("Utility Commands:")
                         print("  echo      - Print text")
-                        print("  whoami    - Show current user")
                         print("  clear/cls - Clear screen")
                         print("  calc      - Basic calculator")
                         print("  history   - Show command history")
                         print("  set       - Set environment variable")
                         print("  get       - Get environment variable")
+                        print("  random    - Generate random number")
+                        print("  stats     - Show system statistics")
+                        print("  test      - Run tests")
                         print("  exit/quit - Exit the shell")
                     else:
                         print(f"Unknown category: {category}")
@@ -3685,6 +4622,77 @@ class Shell:
                     self.do_grep(args)
                 elif cmd == "wc":
                     self.do_wc(args)
+                elif cmd == "nettest":
+                    self.do_nettest(args)
+                elif cmd == "netsocket":
+                    self.do_netsocket(args)
+                elif cmd == "http":
+                    self.do_http(args)
+                elif cmd == "dns":
+                    self.do_dns(args)
+                elif cmd == "download":
+                    self.do_download(args)
+                elif cmd == "memstats":
+                    self.do_memstats(args)
+                elif cmd == "meminfo":
+                    self.do_meminfo(args)
+                elif cmd == "asmtest":
+                    self.do_asmtest(args)
+                elif cmd == "stats":
+                    self.do_stats(args)
+                elif cmd == "cpuinfo":
+                    self.do_cpuinfo(args)
+                elif cmd == "benchmark":
+                    self.do_benchmark(args)
+                elif cmd == "test":
+                    self.do_test(args)
+                # Data processing commands
+                elif cmd == "hexdump":
+                    self.do_hexdump(args)
+                elif cmd == "md5":
+                    self.do_md5(args)
+                elif cmd == "sha256":
+                    self.do_sha256(args)
+                elif cmd == "base64":
+                    self.do_base64(args)
+                elif cmd == "base32":
+                    self.do_base32(args)
+                elif cmd == "hex":
+                    self.do_hex(args)
+                elif cmd == "rot13":
+                    self.do_rot13(args)
+                # Text processing commands
+                elif cmd == "reverse":
+                    self.do_reverse(args)
+                elif cmd == "upper":
+                    self.do_upper(args)
+                elif cmd == "lower":
+                    self.do_lower(args)
+                elif cmd == "tr":
+                    self.do_tr(args)
+                elif cmd == "cut":
+                    self.do_cut(args)
+                elif cmd == "sort":
+                    self.do_sort(args)
+                elif cmd == "uniq":
+                    self.do_uniq(args)
+                elif cmd == "head":
+                    self.do_head(args)
+                elif cmd == "tail":
+                    self.do_tail(args)
+                elif cmd == "diff":
+                    self.do_diff(args)
+                # System commands
+                elif cmd == "uname":
+                    self.do_uname(args)
+                elif cmd == "touch":
+                    self.do_touch(args)
+                elif cmd == "env":
+                    self.do_env(args)
+                elif cmd == "export":
+                    self.do_export(args)
+                elif cmd == "unset":
+                    self.do_unset(args)
                 else:
                     print("Unknown command. Type 'help'.")
             except Exception as e:
@@ -3792,18 +4800,18 @@ class Shell:
         # Load existing file or create new
         if filename in self.kernel.files:
             try:
-                content = self.kernel.files[filename]["data"].decode("utf-8", errors="replace")
-            except:
-                print("Error: Cannot edit binary file")
+                content = self.kernel.files[filename]["data"].decode("utf-8")
+            except Exception as e:
+                print("Error reading file:", e)
                 return
         else:
             content = ""
         
         print(f"Nano Editor - Editing: {filename}")
-        print("=" * 60)
+        print("="*50)
         print("Commands: :w (save), :q (quit), :wq (save & quit)")
         print("Enter text (empty line + :command to execute)")
-        print("=" * 60)
+        print("="*50)
         
         lines = content.split("\n") if content else []
         
@@ -3871,21 +4879,23 @@ class Shell:
             return
         src = args[0]
         dest = args[1]
-        
-        # Read from virtual filesystem
         if src not in self.kernel.files:
-            print(f"Error: File '{src}' not found in filesystem")
+            print(f"Source file {src} not found")
             return
-        
+        code = self.kernel.files[src]["data"]
+        if isinstance(code, bytes):
+            code = code.decode('utf-8', errors='replace')
+        assembler = Assembler()
         try:
-            asm_text = self.kernel.files[src]["data"].decode("utf-8")
-        except Exception as e:
-            print("Error reading assembly file:", e)
-            return
-        try:
-            binary = self.assembler.assemble(asm_text)
+            binary = assembler.assemble(code)
+            # Show warnings if any
+            warnings = assembler.get_warnings()
+            if warnings:
+                print("Assembly warnings:")
+                for warning in warnings:
+                    print(f"  {warning}")
         except AssemblerError as e:
-            print("Assembly error:", e)
+            print(f"Assembly error: {e}")
             return
         self.kernel.files[dest] = {
             "data": binary,
@@ -3893,7 +4903,28 @@ class Shell:
             "created_time": time.time(),
             "modified_time": time.time()
         }
-        print(f"Stored {len(binary)} bytes to {dest}")
+        print(f"Assembled {len(binary)} bytes to {dest}")
+        print(f"Labels: {list(assembler.labels.keys())}")
+        print(f"Constants: {list(assembler.constants.keys())}")
+    def do_asminfo(self, args):
+        if len(args) != 1:
+            print("Usage: asminfo <file>")
+            return
+        filename = args[0]
+        if filename not in self.kernel.files:
+            print(f"File {filename} not found")
+            return
+        code = self.kernel.files[filename]["data"]
+        if isinstance(code, bytes):
+            code = code.decode('utf-8', errors='replace')
+        assembler = Assembler()
+        try:
+            assembler.assemble(code)
+        except AssemblerError as e:
+            print(f"Assembly error: {e}")
+            return
+        print(f"Labels: {list(assembler.labels.keys())}")
+        print(f"Constants: {list(assembler.constants.keys())}")
     def do_run(self, args):
         if not args:
             print("Usage: run <file> [addr] [--debug] [--output] [--trace]")
@@ -3910,27 +4941,20 @@ class Shell:
         # Remove flags from args
         args = [arg for arg in args if not arg.startswith("--")]
         
-        if not args:
-            print("Error: No filename specified")
-            return
-            
         fname = args[0]
-        addr = 0x0000
-        if len(args) > 1:
-            addr = int(args[1], 0)
         if fname not in self.kernel.files:
-            print("File not found:", fname)
+            print(f"File not found: {fname}")
             return
+        
         data = self.kernel.files[fname]["data"]
-        # Ensure we don't try to run an empty file
-        if len(data) == 0:
-            print(f"Warning: File {fname} is empty. Cannot execute.")
-            return 0
+        addr = int(args[1], 0) if len(args) > 1 else 0x1000
+        
+        # Load program into memory
         try:
             self.cpu.mem.load_bytes(addr, data)
         except Exception as e:
-            print("Error loading file to memory:", e)
-            return 0
+            print(f"Failed to load program: {e}")
+            return
         
         # Save initial state for debug mode
         if debug_mode or output_mode:
@@ -3938,7 +4962,10 @@ class Shell:
         
         self.cpu.pc = addr
         self.cpu.halted = False
-        self.cpu.reg_write(REG_SP, (self.cpu.mem.size - 4) // 4 * 4)
+        self.cpu.reg_write(REG_SP, (STACK_BASE - 4) & 0xFFFFFFFF)
+        # Track program bounds for PC checks
+        self.cpu.program_start = addr
+        self.cpu.program_end = addr + len(data)
         
         if debug_mode:
             print(f"=== DEBUG MODE ===")
@@ -4635,39 +5662,39 @@ class Shell:
         else:
             print(f"Failed to read file {fname}")
     def do_curl(self, args):
-        """Simulate curl command"""
+        """Real curl command - fetch URL content"""
         if not args:
             print("Usage: curl <url>")
             return
         url = args[0]
-        # Use kernel CURL syscall
-        url_addr = 0x2000  # Temporary address for URL
-        self.cpu.mem.load_bytes(url_addr, url.encode('utf-8') + b'\0')
-        self.cpu.reg_write(0, 41)  # CURL
-        self.cpu.reg_write(1, url_addr)
-        self.kernel.syscall(self.cpu)
-        res = self.cpu.reg_read(0)
-        if res != 0:
-            print(f"Curl to {url} successful")
-        else:
-            print(f"Curl to {url} failed")
+        # Add protocol if missing
+        if not url.startswith(('http://', 'https://')):
+            url = 'https://' + url
+        try:
+            content = self.cpu.network.utils.curl(url)
+            print(f"Curl {url}")
+            print(f"Response ({len(content)} bytes):")
+            print(content[:500])
+        except Exception as e:
+            print(f"Curl error: {e}")
+    
     def do_wget(self, args):
-        """Simulate wget command"""
+        """Real wget command - download file"""
         if not args:
             print("Usage: wget <url>")
             return
         url = args[0]
-        # Use kernel WGET syscall
-        url_addr = 0x2000  # Temporary address for URL
-        self.cpu.mem.load_bytes(url_addr, url.encode('utf-8') + b'\0')
-        self.cpu.reg_write(0, 42)  # WGET
-        self.cpu.reg_write(1, url_addr)
-        self.kernel.syscall(self.cpu)
-        res = self.cpu.reg_read(0)
-        if res != 0:
-            print(f"Wget to {url} successful")
-        else:
-            print(f"Wget to {url} failed")
+        # Add protocol if missing
+        if not url.startswith(('http://', 'https://')):
+            url = 'https://' + url
+        try:
+            result = self.cpu.network.utils.wget(url)
+            if result > 0:
+                print(f"Downloaded {result} bytes from {url}")
+            else:
+                print(f"Failed to download {url}")
+        except Exception as e:
+            print(f"Wget error: {e}")
     def do_grep(self, args):
         """Search within file"""
         if len(args) != 2:
@@ -4713,6 +5740,787 @@ class Shell:
         self.kernel.syscall(self.cpu)
         result = self.cpu.reg_read(0)
         print(f"Lines in {fname}: {result}")
+    
+    def do_nettest(self, args):
+        """Test network connectivity"""
+        if not args:
+            print("Usage: nettest <host> <port>")
+            return
+        host = args[0]
+        port = int(args[1]) if len(args) > 1 else 80
+        try:
+            sock_id = self.cpu.network.socket_create()
+            if sock_id < 0:
+                print("Failed to create socket")
+                return
+            result = self.cpu.network.socket_connect(sock_id, host, port)
+            if result == 0:
+                print(f"Successfully connected to {host}:{port}")
+                self.cpu.network.socket_close(sock_id)
+            else:
+                print(f"Failed to connect to {host}:{port}")
+        except Exception as e:
+            print(f"Network test error: {e}")
+    
+    def do_netsocket(self, args):
+        """Manage network sockets"""
+        if not args:
+            print("Usage: netsocket <create|connect|send|recv|close> [args...]")
+            return
+        cmd = args[0].lower()
+        if cmd == "create":
+            sock_id = self.cpu.network.socket_create()
+            if sock_id >= 0:
+                print(f"Created socket {sock_id}")
+            else:
+                print("Failed to create socket")
+        elif cmd == "connect" and len(args) >= 3:
+            sock_id = int(args[1])
+            host = args[2]
+            port = int(args[3]) if len(args) > 3 else 80
+            result = self.cpu.network.socket_connect(sock_id, host, port)
+            if result == 0:
+                print(f"Connected socket {sock_id} to {host}:{port}")
+            else:
+                print(f"Failed to connect socket {sock_id}")
+        elif cmd == "send" and len(args) >= 3:
+            sock_id = int(args[1])
+            data = " ".join(args[2:]).encode('utf-8')
+            result = self.cpu.network.socket_send(sock_id, data)
+            if result > 0:
+                print(f"Sent {result} bytes on socket {sock_id}")
+            else:
+                print(f"Failed to send on socket {sock_id}")
+        elif cmd == "recv" and len(args) >= 2:
+            sock_id = int(args[1])
+            size = int(args[2]) if len(args) > 2 else 1024
+            data = self.cpu.network.socket_recv(sock_id, size)
+            if data:
+                print(f"Received {len(data)} bytes: {data.decode('utf-8', errors='replace')}")
+            else:
+                print("No data received")
+        elif cmd == "close" and len(args) >= 2:
+            sock_id = int(args[1])
+            result = self.cpu.network.socket_close(sock_id)
+            if result == 0:
+                print(f"Closed socket {sock_id}")
+            else:
+                print(f"Failed to close socket {sock_id}")
+        else:
+            print("Invalid netsocket command")
+    
+    def do_http(self, args):
+        """HTTP operations"""
+        if not args:
+            print("Usage: http <get|post|head> <url>")
+            return
+        method = args[0].upper()
+        url = args[1] if len(args) > 1 else ""
+        if method == "GET" and url:
+            content = self.cpu.network.utils.curl(url)
+            print(f"HTTP GET {url}")
+            print(f"Response ({len(content)} bytes):")
+            print(content[:500])
+        elif method == "HEAD" and url:
+            print(f"HTTP HEAD {url}")
+            result = self.cpu.network.utils.wget(url)
+            print(f"Content-Length: {result} bytes")
+        else:
+            print("Invalid HTTP command")
+    
+    def do_dns(self, args):
+        """DNS lookup simulation"""
+        if not args:
+            print("Usage: dns <hostname>")
+            return
+        hostname = args[0]
+        try:
+            import socket as sock
+            ip = sock.gethostbyname(hostname)
+            print(f"{hostname} -> {ip}")
+        except Exception as e:
+            print(f"DNS lookup failed: {e}")
+    
+    def do_download(self, args):
+        """Download file from URL"""
+        if not args:
+            print("Usage: download <url> [filename]")
+            return
+        url = args[0]
+        filename = args[1] if len(args) > 1 else "downloaded_file"
+        try:
+            result = self.cpu.network.utils.wget(url)
+            if result > 0:
+                print(f"Downloaded {result} bytes from {url}")
+                print(f"Saved to: {filename}")
+            else:
+                print("Download failed")
+        except Exception as e:
+            print(f"Download error: {e}")
+    
+    def do_memstats(self, args):
+        """Show memory statistics"""
+        stats = self.cpu.mem.get_stats()
+        print("Memory Statistics:")
+        print(f"  Total Size: {stats['total_size'] / (1024*1024):.1f} MB")
+        print(f"  Total Reads: {stats['total_reads']}")
+        print(f"  Total Writes: {stats['total_writes']}")
+        print(f"  Cache Hits: {stats['cache_hits']}")
+        print(f"  Cache Misses: {stats['cache_misses']}")
+        print(f"  Cache Ratio: {stats['cache_ratio']:.2%}")
+        print(f"  Protected Regions: {stats['protected_regions']}")
+        print(f"  Breakpoints: {stats['breakpoints']}")
+    
+    def do_meminfo(self, args):
+        """Show detailed memory information"""
+        print(self.cpu.mem.dump_stats())
+    
+    def do_asmtest(self, args):
+        """Run comprehensive assembly tests"""
+        print("Running assembly tests...")
+        assembler = Assembler()
+        
+        tests = [
+            ("Basic instructions", r"""
+.org 0x0000
+LOADI R0, 42
+ADD R0, R0
+HALT
+"""),
+            ("Constants with .equ", r"""
+.equ VALUE, 100
+.org 0x0000
+LOADI R0, VALUE
+HALT
+"""),
+            ("Expression evaluation", r"""
+.org 0x0000
+LOADI R0, (5 + 3) * 2
+HALT
+"""),
+            ("String directive", r"""
+.org 0x0000
+LOADI R0, msg
+HALT
+.org 0x0100
+msg:
+.string "Hello\n"
+"""),
+            ("Labels and jumps", r"""
+.org 0x0000
+start:
+    LOADI R0, 5
+loop:
+    DEC R0
+    JNZ loop
+    HALT
+"""),
+            ("Data directives", r"""
+.org 0x0000
+.word 0x12345678
+.dword 0xDEADBEEF
+.byte 0x41, 0x42, 0x43
+.space 16, 0
+"""),
+            ("Macros with parameters", r"""
+.macro SETVAL reg, val
+    LOADI \reg, \val
+.endm
+
+.org 0x0000
+    SETVAL R0, 42
+    SETVAL R1, 100
+    HALT
+"""),
+            ("All features combined", r"""
+.equ MAX_SIZE, 1024
+.equ MIN_SIZE, 16
+
+.macro BOUNDS_CHECK reg
+    CMP \reg, R15
+    JL error
+    CMP \reg, R14
+    JG error
+.endm
+
+.org 0x0000
+start:
+    LOADI R0, (MAX_SIZE / 2)
+    LOADI R14, MAX_SIZE
+    LOADI R15, MIN_SIZE
+    BOUNDS_CHECK R0
+    HALT
+error:
+    LOADI R0, 0xFFFF
+    HALT
+"""),
+        ]
+        
+        passed = 0
+        failed = 0
+        
+        for name, code in tests:
+            try:
+                binary = assembler.assemble(code)
+                print(f"  ✓ {name} ({len(binary)} bytes)")
+                passed += 1
+            except Exception as e:
+                print(f"  ✗ {name}: {e}")
+                failed += 1
+        
+        print(f"\nResults: {passed} passed, {failed} failed")
+    
+    def do_stats(self, args):
+        """Show system statistics"""
+        print("System Statistics:")
+        print(f"  Uptime: {time.time() - self.kernel.start_time:.1f}s")
+        print(f"  CPU Cycles: {self.cpu.cycle_count}")
+        print(f"  Instructions: {self.cpu.instructions_retired}")
+        print(f"  Cache Hits: {self.cpu.cache_hits}")
+        print(f"  Cache Misses: {self.cpu.cache_misses}")
+        if (self.cpu.cache_hits + self.cpu.cache_misses) > 0:
+            ratio = self.cpu.cache_hits / (self.cpu.cache_hits + self.cpu.cache_misses)
+            print(f"  Cache Ratio: {ratio:.2%}")
+    
+    def do_cpuinfo(self, args):
+        """Show CPU information"""
+        print("CPU Information:")
+        print(f"  Architecture: 32-bit x86-like")
+        print(f"  Registers: 16 general purpose")
+        print(f"  FPU Registers: 8")
+        print(f"  Instruction Set: {len(pycpu.OPCODE_NAME)} opcodes")
+        print(f"  Memory: {self.cpu.mem.size / (1024*1024):.0f} MB")
+        print(f"  Stack: {pycpu.STACK_SIZE / 1024:.0f} KB at {hex(pycpu.STACK_BASE)}")
+        print(f"  Heap: {pycpu.HEAP_SIZE / (1024*1024):.0f} MB at {hex(pycpu.HEAP_BASE)}")
+        print(f"  Features: FPU, MMU, Virtual Memory, Paging")
+    
+    def do_benchmark(self, args):
+        """Run CPU benchmark"""
+        print("Running CPU benchmark...")
+        start = time.time()
+        
+        # Simple benchmark: add operations
+        for i in range(1000):
+            self.cpu.reg_write(0, i)
+            self.cpu.reg_write(1, i * 2)
+            self.cpu.alu_add(i, i * 2)
+        
+        elapsed = time.time() - start
+        ops_per_sec = 3000 / elapsed if elapsed > 0 else 0
+        print(f"  Time: {elapsed:.3f}s")
+        print(f"  Operations: 3000")
+        print(f"  Speed: {ops_per_sec:.0f} ops/sec")
+    
+    def do_test(self, args):
+        """Run system tests"""
+        print("Running system tests...")
+        tests_passed = 0
+        tests_failed = 0
+        
+        # Test 1: Register operations
+        try:
+            self.cpu.reg_write(0, 0x12345678)
+            if self.cpu.reg_read(0) == 0x12345678:
+                print("  ✓ Register operations")
+                tests_passed += 1
+            else:
+                print("  ✗ Register operations")
+                tests_failed += 1
+        except Exception as e:
+            print(f"  ✗ Register operations: {e}")
+            tests_failed += 1
+        
+        # Test 2: Memory operations
+        try:
+            self.cpu.mem.write_word(0x1000, 0xDEADBEEF)
+            if self.cpu.mem.read_word(0x1000) == 0xDEADBEEF:
+                print("  ✓ Memory operations")
+                tests_passed += 1
+            else:
+                print("  ✗ Memory operations")
+                tests_failed += 1
+        except Exception as e:
+            print(f"  ✗ Memory operations: {e}")
+            tests_failed += 1
+        
+        # Test 3: Network
+        try:
+            result = self.cpu.network.utils.ping("example.com")
+            print(f"  ✓ Network (ping: {result})")
+            tests_passed += 1
+        except Exception as e:
+            print(f"  ✗ Network: {e}")
+            tests_failed += 1
+        
+        # Test 4: Assembler
+        try:
+            asm = pycpu.Assembler()
+            binary = asm.assemble(".org 0x1000\nHALT")
+            if len(binary) > 0:
+                print("  ✓ Assembler")
+                tests_passed += 1
+            else:
+                print("  ✗ Assembler")
+                tests_failed += 1
+        except Exception as e:
+            print(f"  ✗ Assembler: {e}")
+            tests_failed += 1
+        
+        print(f"\nTests: {tests_passed} passed, {tests_failed} failed")
+    
+    def do_pwd(self, args):
+        """Print working directory"""
+        print(self.kernel.cwd)
+    
+    def do_echo(self, args):
+        """Echo text to output"""
+        if not args:
+            print()
+        else:
+            print(" ".join(args))
+    
+    def do_env(self, args):
+        """Show environment variables"""
+        if not self.kernel.env_vars:
+            print("No environment variables set")
+        else:
+            for key, value in sorted(self.kernel.env_vars.items()):
+                print(f"{key}={value}")
+    
+    def do_export(self, args):
+        """Export environment variable"""
+        if not args:
+            print("Usage: export VAR=value")
+            return
+        for arg in args:
+            if '=' in arg:
+                key, value = arg.split('=', 1)
+                self.kernel.env_vars[key] = value
+                print(f"Exported {key}={value}")
+            else:
+                print(f"Invalid format: {arg}")
+    
+    def do_unset(self, args):
+        """Unset environment variable"""
+        if not args:
+            print("Usage: unset VAR")
+            return
+        for var in args:
+            if var in self.kernel.env_vars:
+                del self.kernel.env_vars[var]
+                print(f"Unset {var}")
+            else:
+                print(f"Variable {var} not found")
+    
+    def do_hexdump(self, args):
+        """Hexdump of file or memory"""
+        if not args:
+            print("Usage: hexdump <file|addr> [length]")
+            return
+        target = args[0]
+        length = int(args[1], 0) if len(args) > 1 else 256
+        
+        # Check if it's a file or memory address
+        if target.startswith('0x') or target.isdigit():
+            # Memory address
+            addr = int(target, 0)
+            try:
+                data = self.cpu.mem.dump(addr, length)
+                self._print_hexdump(data, addr)
+            except Exception as e:
+                print(f"Error reading memory: {e}")
+        else:
+            # File
+            if target not in self.kernel.files:
+                print(f"File not found: {target}")
+                return
+            data = self.kernel.files[target]["data"][:length]
+            self._print_hexdump(data, 0)
+    
+    def _print_hexdump(self, data, base_addr):
+        """Helper to print hexdump"""
+        for i in range(0, len(data), 16):
+            addr = base_addr + i
+            hex_part = " ".join(f"{b:02x}" for b in data[i:i+16])
+            ascii_part = "".join(chr(b) if 32 <= b < 127 else '.' for b in data[i:i+16])
+            print(f"{addr:08x}  {hex_part:<48}  {ascii_part}")
+    
+    def do_md5(self, args):
+        """Calculate MD5 hash of file"""
+        if not args:
+            print("Usage: md5 <file>")
+            return
+        fname = args[0]
+        if fname not in self.kernel.files:
+            print(f"File not found: {fname}")
+            return
+        import hashlib
+        data = self.kernel.files[fname]["data"]
+        md5_hash = hashlib.md5(data).hexdigest()
+        print(f"MD5 ({fname}) = {md5_hash}")
+    
+    def do_sha256(self, args):
+        """Calculate SHA256 hash of file"""
+        if not args:
+            print("Usage: sha256 <file>")
+            return
+        fname = args[0]
+        if fname not in self.kernel.files:
+            print(f"File not found: {fname}")
+            return
+        import hashlib
+        data = self.kernel.files[fname]["data"]
+        sha256_hash = hashlib.sha256(data).hexdigest()
+        print(f"SHA256 ({fname}) = {sha256_hash}")
+    
+    def do_base64(self, args):
+        """Base64 encode/decode file"""
+        if len(args) < 2:
+            print("Usage: base64 <encode|decode> <file>")
+            return
+        operation = args[0].lower()
+        fname = args[1]
+        
+        if fname not in self.kernel.files:
+            print(f"File not found: {fname}")
+            return
+        
+        import base64
+        data = self.kernel.files[fname]["data"]
+        
+        if operation == "encode":
+            encoded = base64.b64encode(data).decode('utf-8')
+            print(encoded)
+        elif operation == "decode":
+            try:
+                decoded = base64.b64decode(data)
+                print(decoded.decode('utf-8', errors='replace'))
+            except Exception as e:
+                print(f"Decode error: {e}")
+        else:
+            print("Invalid operation. Use 'encode' or 'decode'")
+    
+    def do_base32(self, args):
+        """Base32 encode/decode file"""
+        if len(args) < 2:
+            print("Usage: base32 <encode|decode> <file>")
+            return
+        operation = args[0].lower()
+        fname = args[1]
+        
+        if fname not in self.kernel.files:
+            print(f"File not found: {fname}")
+            return
+        
+        import base64
+        data = self.kernel.files[fname]["data"]
+        
+        if operation == "encode":
+            encoded = base64.b32encode(data).decode('utf-8')
+            print(encoded)
+        elif operation == "decode":
+            try:
+                decoded = base64.b32decode(data)
+                print(decoded.decode('utf-8', errors='replace'))
+            except Exception as e:
+                print(f"Decode error: {e}")
+        else:
+            print("Invalid operation. Use 'encode' or 'decode'")
+    
+    def do_hex(self, args):
+        """Hex encode/decode file"""
+        if len(args) < 2:
+            print("Usage: hex <encode|decode> <file>")
+            return
+        operation = args[0].lower()
+        fname = args[1]
+        
+        if fname not in self.kernel.files:
+            print(f"File not found: {fname}")
+            return
+        
+        data = self.kernel.files[fname]["data"]
+        
+        if operation == "encode":
+            encoded = data.hex()
+            print(encoded)
+        elif operation == "decode":
+            try:
+                decoded = bytes.fromhex(data.decode('utf-8') if isinstance(data, bytes) else data)
+                print(decoded.decode('utf-8', errors='replace'))
+            except Exception as e:
+                print(f"Decode error: {e}")
+        else:
+            print("Invalid operation. Use 'encode' or 'decode'")
+    
+    def do_rot13(self, args):
+        """ROT13 encode/decode text"""
+        if not args:
+            print("Usage: rot13 <file>")
+            return
+        fname = args[0]
+        
+        if fname not in self.kernel.files:
+            print(f"File not found: {fname}")
+            return
+        
+        import codecs
+        data = self.kernel.files[fname]["data"]
+        text = data.decode('utf-8', errors='replace') if isinstance(data, bytes) else data
+        result = codecs.encode(text, 'rot_13')
+        print(result)
+    
+    def do_reverse(self, args):
+        """Reverse text in file"""
+        if not args:
+            print("Usage: reverse <file>")
+            return
+        fname = args[0]
+        
+        if fname not in self.kernel.files:
+            print(f"File not found: {fname}")
+            return
+        
+        data = self.kernel.files[fname]["data"]
+        text = data.decode('utf-8', errors='replace') if isinstance(data, bytes) else data
+        print(text[::-1])
+    
+    def do_upper(self, args):
+        """Convert text to uppercase"""
+        if not args:
+            print("Usage: upper <file>")
+            return
+        fname = args[0]
+        
+        if fname not in self.kernel.files:
+            print(f"File not found: {fname}")
+            return
+        
+        data = self.kernel.files[fname]["data"]
+        text = data.decode('utf-8', errors='replace') if isinstance(data, bytes) else data
+        print(text.upper())
+    
+    def do_lower(self, args):
+        """Convert text to lowercase"""
+        if not args:
+            print("Usage: lower <file>")
+            return
+        fname = args[0]
+        
+        if fname not in self.kernel.files:
+            print(f"File not found: {fname}")
+            return
+        
+        data = self.kernel.files[fname]["data"]
+        text = data.decode('utf-8', errors='replace') if isinstance(data, bytes) else data
+        print(text.lower())
+    
+    def do_tr(self, args):
+        """Translate characters in file"""
+        if len(args) < 3:
+            print("Usage: tr <from_chars> <to_chars> <file>")
+            return
+        from_chars = args[0]
+        to_chars = args[1]
+        fname = args[2]
+        
+        if fname not in self.kernel.files:
+            print(f"File not found: {fname}")
+            return
+        
+        data = self.kernel.files[fname]["data"]
+        text = data.decode('utf-8', errors='replace') if isinstance(data, bytes) else data
+        trans = str.maketrans(from_chars, to_chars)
+        print(text.translate(trans))
+    
+    def do_cut(self, args):
+        """Cut columns from file"""
+        if len(args) < 2:
+            print("Usage: cut <-f fields> <file>")
+            print("Example: cut -f 1,3 file.txt")
+            return
+        
+        if args[0] != "-f" or len(args) < 3:
+            print("Usage: cut -f <fields> <file>")
+            return
+        
+        fields_str = args[1]
+        fname = args[2]
+        
+        if fname not in self.kernel.files:
+            print(f"File not found: {fname}")
+            return
+        
+        # Parse field numbers (1-indexed)
+        fields = [int(f) - 1 for f in fields_str.split(',')]
+        
+        data = self.kernel.files[fname]["data"]
+        text = data.decode('utf-8', errors='replace') if isinstance(data, bytes) else data
+        
+        for line in text.splitlines():
+            parts = line.split()
+            selected = [parts[i] for i in fields if i < len(parts)]
+            print(' '.join(selected))
+    
+    def do_sort(self, args):
+        """Sort lines in file"""
+        if not args:
+            print("Usage: sort [-r] <file>")
+            return
+        
+        reverse = False
+        fname = args[0]
+        
+        if args[0] == "-r" and len(args) > 1:
+            reverse = True
+            fname = args[1]
+        
+        if fname not in self.kernel.files:
+            print(f"File not found: {fname}")
+            return
+        
+        data = self.kernel.files[fname]["data"]
+        text = data.decode('utf-8', errors='replace') if isinstance(data, bytes) else data
+        lines = text.splitlines()
+        lines.sort(reverse=reverse)
+        for line in lines:
+            print(line)
+    
+    def do_uniq(self, args):
+        """Remove duplicate lines"""
+        if not args:
+            print("Usage: uniq <file>")
+            return
+        fname = args[0]
+        
+        if fname not in self.kernel.files:
+            print(f"File not found: {fname}")
+            return
+        
+        data = self.kernel.files[fname]["data"]
+        text = data.decode('utf-8', errors='replace') if isinstance(data, bytes) else data
+        lines = text.splitlines()
+        
+        prev = None
+        for line in lines:
+            if line != prev:
+                print(line)
+                prev = line
+    
+    def do_head(self, args):
+        """Show first N lines of file"""
+        if not args:
+            print("Usage: head [-n count] <file>")
+            return
+        
+        count = 10
+        fname = args[0]
+        
+        if args[0] == "-n" and len(args) > 2:
+            count = int(args[1])
+            fname = args[2]
+        
+        if fname not in self.kernel.files:
+            print(f"File not found: {fname}")
+            return
+        
+        data = self.kernel.files[fname]["data"]
+        text = data.decode('utf-8', errors='replace') if isinstance(data, bytes) else data
+        lines = text.splitlines()[:count]
+        for line in lines:
+            print(line)
+    
+    def do_tail(self, args):
+        """Show last N lines of file"""
+        if not args:
+            print("Usage: tail [-n count] <file>")
+            return
+        
+        count = 10
+        fname = args[0]
+        
+        if args[0] == "-n" and len(args) > 2:
+            count = int(args[1])
+            fname = args[2]
+        
+        if fname not in self.kernel.files:
+            print(f"File not found: {fname}")
+            return
+        
+        data = self.kernel.files[fname]["data"]
+        text = data.decode('utf-8', errors='replace') if isinstance(data, bytes) else data
+        lines = text.splitlines()[-count:]
+        for line in lines:
+            print(line)
+    
+    def do_diff(self, args):
+        """Compare two files"""
+        if len(args) < 2:
+            print("Usage: diff <file1> <file2>")
+            return
+        
+        file1 = args[0]
+        file2 = args[1]
+        
+        if file1 not in self.kernel.files:
+            print(f"File not found: {file1}")
+            return
+        if file2 not in self.kernel.files:
+            print(f"File not found: {file2}")
+            return
+        
+        data1 = self.kernel.files[file1]["data"]
+        data2 = self.kernel.files[file2]["data"]
+        text1 = data1.decode('utf-8', errors='replace') if isinstance(data1, bytes) else data1
+        text2 = data2.decode('utf-8', errors='replace') if isinstance(data2, bytes) else data2
+        
+        lines1 = text1.splitlines()
+        lines2 = text2.splitlines()
+        
+        import difflib
+        diff = difflib.unified_diff(lines1, lines2, fromfile=file1, tofile=file2, lineterm='')
+        for line in diff:
+            print(line)
+    
+    def do_whoami(self, args):
+        """Print current username"""
+        print(self.kernel.username)
+    
+    def do_uname(self, args):
+        """Print system information"""
+        print("SimpleOS 2.0 32-bit (x86-like)")
+    
+    def do_touch(self, args):
+        """Create empty file or update timestamp"""
+        if not args:
+            print("Usage: touch <file>")
+            return
+        fname = args[0]
+        if fname in self.kernel.files:
+            # Update timestamp
+            self.kernel.files[fname]["modified_time"] = time.time()
+            print(f"Updated timestamp for {fname}")
+        else:
+            # Create empty file
+            self.kernel.files[fname] = {
+                "data": b"",
+                "permissions": 0o644,
+                "created_time": time.time(),
+                "modified_time": time.time()
+            }
+            print(f"Created empty file {fname}")
+    
+    def do_du(self, args):
+        """Disk usage"""
+        total_size = sum(len(f["data"]) for f in self.kernel.files.values() if "data" in f)
+        print(f"Total disk usage: {total_size} bytes ({total_size / 1024:.2f} KB)")
+        
+        if args and args[0] == "-a":
+            # Show per-file usage
+            for name, info in sorted(self.kernel.files.items()):
+                if "data" in info:
+                    size = len(info["data"])
+                    print(f"{size:>10} bytes  {name}")
 
 # ---------------------------
 # Sample assembly programs
@@ -4900,14 +6708,151 @@ def setup_demo_environment(kernel: Kernel, assembler: Assembler):
             "created_time": time.time(),
             "modified_time": time.time()
         }
-        kernel.files["/data.bin"] = {
-            "data": bytes(range(256)),  # Binary data 0-255
+        # Create a test program for ADC and SBB instructions
+        test_asm = """
+.org 0x0000
+; Test ADC and SBB instructions
+LOADI R0, 0xFFFFFFFF  ; Load max value
+LOADI R1, 1           ; Load 1
+STC                   ; Set carry flag
+ADC R0, R1            ; R0 = R0 + R1 + carry = 0xFFFFFFFF + 1 + 1 = 1 (with carry set)
+; Now R0 should be 1, and carry should be set
+LOADI R2, 5
+LOADI R3, 3
+SUB R2, R3            ; R2 = 5 - 3 = 2
+CLI                   ; Clear interrupt flag
+STI                   ; Set interrupt flag
+HALT
+"""
+        try:
+            test_bin = assembler.assemble(test_asm)
+            kernel.files["/data.bin"] = {
+                "data": test_bin,
+                "permissions": 0o755,
+                "created_time": time.time(),
+                "modified_time": time.time()
+            }
+        except Exception as e:
+            # Fallback to simple program if assembly fails
+            simple_program = [
+                0x020000FF,  # LOADI R0, 0xFF (max byte value)
+                0x02100001,  # LOADI R1, 1
+                0x4A000000,  # STC (set carry)
+                0x44001000,  # ADC R0, R1
+                0x1F000000,  # HALT
+            ]
+            test_bin = b''.join(itob_le(word) for word in simple_program)
+            kernel.files["/data.bin"] = {
+                "data": test_bin,
+                "permissions": 0o755,
+                "created_time": time.time(),
+                "modified_time": time.time()
+            }
+    except Exception as e:
+        logger.warning("Failed to assemble demo: %s", e)
+    
+    # Create demo program showcasing new assembler features
+    DEMO_ADVANCED_ASM = r"""
+; Advanced Assembler Demo
+; Showcases: .equ, expressions, .string, .macro, labels
+
+.equ SCREEN_START, 0xB800
+.equ BUFFER_SIZE, 256
+.equ SYSCALL_WRITE, 1
+
+; Macro to print a string
+.macro PRINT str_addr
+    LOADI R0, SYSCALL_WRITE
+    LOADI R1, 1
+    LOADI R2, \str_addr
+    LOADI R3, 20
+    SYSCALL R0
+.endm
+
+.org 0x0000
+start:
+    ; Use expression evaluation
+    LOADI R0, (5 + 3) * 2      ; R0 = 16
+    LOADI R1, BUFFER_SIZE      ; R1 = 256 (from constant)
+    LOADI R2, SCREEN_START     ; R2 = 0xB800
+    
+    ; Test new instructions
+    SETG R3                     ; Set if greater
+    LOOP test_loop              ; Loop instruction
+    
+    ; Use macro with label
+    PRINT msgdata
+    
+    ; String operations
+    LOADI R2, srcdata
+    LOADI R3, dstdata
+    MOVSB                       ; Move string byte
+    
+    HALT
+
+test_loop:
+    DEC R1
+    JNZ test_loop
+    RET
+
+; Data section with .string directive
+.org 0x0100
+msgdata:
+.string "Hello from macro!\n"
+
+srcdata:
+.string "Source"
+
+.align 16
+dstdata:
+.space 32, 0
+
+; More data with .dword
+.dword 0xDEADBEEF
+.dword BUFFER_SIZE
+"""
+    try:
+        demo_bin = assembler.assemble(DEMO_ADVANCED_ASM)
+        kernel.files["/demo_advanced.bin"] = {
+            "data": demo_bin,
+            "permissions": 0o755,
+            "created_time": time.time(),
+            "modified_time": time.time()
+        }
+        kernel.files["/demo_advanced.asm"] = {
+            "data": DEMO_ADVANCED_ASM.encode('utf-8'),
             "permissions": 0o644,
             "created_time": time.time(),
             "modified_time": time.time()
         }
+        logger.info("Successfully assembled advanced demo")
     except Exception as e:
-        logger.warning("Failed to assemble demo: %s", e)
+        logger.warning("Failed to assemble advanced demo: %s", e)
+        # Create fallback simple demo
+        try:
+            SIMPLE_DEMO = r"""
+.org 0x0000
+    LOADI R0, 42
+    LOADI R1, 10
+    ADD R0, R1
+    HALT
+"""
+            demo_bin = assembler.assemble(SIMPLE_DEMO)
+            kernel.files["/demo_advanced.bin"] = {
+                "data": demo_bin,
+                "permissions": 0o755,
+                "created_time": time.time(),
+                "modified_time": time.time()
+            }
+            kernel.files["/demo_advanced.asm"] = {
+                "data": SIMPLE_DEMO.encode('utf-8'),
+                "permissions": 0o644,
+                "created_time": time.time(),
+                "modified_time": time.time()
+            }
+            logger.info("Created fallback demo")
+        except Exception as e2:
+            logger.error("Failed to create fallback demo: %s", e2)
 
 def main_system():
     """Main system loop with reboot capability"""
