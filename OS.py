@@ -42,10 +42,51 @@ DEFAULT_MEMORY_BYTES = 64 * 1024 * 1024  # 64 MiB default (increased)
 NUM_REGS = 16
 NUM_FPU_REGS = 8  # Floating point registers
 # Registers indices
-REG_SP = 14
+REG_R0 = 0
+REG_R1 = 1
+REG_R2 = 2
+REG_R3 = 3
+REG_R4 = 4
+REG_R5 = 5
+REG_R6 = 6
+REG_R7 = 7
+REG_R8 = 8
+REG_R9 = 9
+REG_R10 = 10
+REG_R11 = 11
+REG_R12 = 12
 REG_KERNEL = 13  # reserved for kernel use in syscalls (optional)
-REG_PC = 15  # not in regs array; CPU stores pc separately
-# Flags
+REG_SP = 14      # Stack Pointer
+REG_PC = 15      # Program Counter (not in regs array)
+
+# Segment registers
+REG_CS = 0  # Code Segment
+REG_DS = 1  # Data Segment
+REG_ES = 2  # Extra Segment
+REG_FS = 3  # F Segment
+REG_GS = 4  # G Segment
+REG_SS = 5  # Stack Segment
+
+# Control registers
+REG_CR0 = 0
+REG_CR1 = 1  # Reserved
+REG_CR2 = 2  # Page Fault Linear Address
+REG_CR3 = 3  # Page Directory Base Register
+REG_CR4 = 4
+# Control Register 0 (CR0) flags
+CR0_PE = 1 << 0    # Protection Enable
+CR0_MP = 1 << 1    # Monitor Coprocessor
+CR0_EM = 1 << 2    # Emulation
+CR0_TS = 1 << 3    # Task Switched
+CR0_ET = 1 << 4    # Extension Type
+CR0_NE = 1 << 5    # Numeric Error
+CR0_WP = 1 << 16   # Write Protect
+CR0_AM = 1 << 18   # Alignment Mask
+CR0_NW = 1 << 29   # Not Write-through
+CR0_CD = 1 << 30   # Cache Disable
+CR0_PG = 1 << 31   # Paging
+
+# CPU Flags
 FLAG_ZERO = 1 << 0
 FLAG_NEG = 1 << 1
 FLAG_CARRY = 1 << 2
@@ -55,6 +96,14 @@ FLAG_TRAP = 1 << 5
 # --- Additional Flags ---
 FLAG_AUX = 1 << 6  # Auxiliary Carry Flag (for BCD operations)
 FLAG_DIR = 1 << 7  # Direction Flag (for string operations)
+
+# x86-style flag aliases
+FLAG_CF = FLAG_CARRY       # Carry Flag
+FLAG_PF = 1 << 29          # Parity Flag (use unique bit)
+FLAG_AF = FLAG_AUX         # Auxiliary Carry Flag
+FLAG_ZF = FLAG_ZERO        # Zero Flag
+FLAG_SF = FLAG_NEG         # Sign Flag
+FLAG_OF = FLAG_OVERFLOW    # Overflow Flag
 FLAG_IOPL = 1 << 8  # I/O Privilege Level (for privilege levels)
 FLAG_NT = 1 << 9   # Nested Task Flag (for task switching)
 FLAG_RF = 1 << 10  # Resume Flag (for debugging)
@@ -98,6 +147,7 @@ FLAG_NAME_MAP: Dict[str, int] = {
     'VMX': FLAG_VMX,
     'SMEP': FLAG_SMEP,
 }
+
 
 # Add a few more small flags
 FLAG_PAE = 1 << 23  # Physical Address Extension (just for demo)
@@ -266,7 +316,42 @@ OP_SETACC = 0xAC  # Set ACC from reg/imm
 OP_GETACC = 0xAD  # Get ACC into reg
 OP_ACCADD = 0xAE  # ACC = ACC + reg/imm
 OP_ACCSUB = 0xAF  # ACC = ACC - reg/imm
+# New useful instructions
+OP_XCHG = 0xB0  # Exchange two registers
+OP_NEG = 0xB1  # Negate (two's complement)
+OP_SAR = 0xB2  # Arithmetic right shift (sign-extending)
+OP_ROL = 0xB3  # Rotate left
+OP_ROR = 0xB4  # Rotate right
+OP_BT = 0xB5  # Bit test
+OP_BTS = 0xB6  # Bit test and set
+OP_BTR = 0xB7  # Bit test and reset
+OP_BTC = 0xB8  # Bit test and complement
+OP_BSF = 0xB9  # Bit scan forward
+OP_BSR = 0xBA  # Bit scan reverse
+OP_BSWAP = 0xBB  # Byte swap
+OP_CMOV = 0xBC  # Conditional move
+OP_SETZ = 0xBD  # Set if zero
+OP_SETNZ = 0xBE  # Set if not zero
+OP_SETL = 0xBF  # Set if less
+# Additional useful instructions
+OP_MOVB = 0xC0  # Move byte (8-bit)
+OP_MOVW = 0xC1  # Move word (16-bit)
+OP_LOADB = 0xC2  # Load byte from memory
+OP_STOREB = 0xC3  # Store byte to memory
+OP_SEXT = 0xC4  # Sign extend (byte to word)
+OP_ZEXT = 0xC5  # Zero extend (byte to word)
+OP_POPCNT = 0xC6  # Population count (count set bits)
+# String and memory operations
+OP_MEMCPY = 0xC7  # Memory copy (dst_addr, src_addr, length)
+OP_MEMSET = 0xC8  # Memory set (dst_addr, value, length)
+OP_STRLEN = 0xC9  # String length
+OP_STRCMP = 0xCA  # String compare
+OP_MIN = 0xCB  # Minimum of two values
+OP_MAX = 0xCC  # Maximum of two values
+OP_ABS = 0xCD  # Absolute value
+OP_CLAMP = 0xCE  # Clamp value between min and max
 OPCODE_NAME = {
+    # Regular Instructions
     OP_NOP: "NOP",
     OP_MOV: "MOV",
     OP_LOADI: "LOADI",
@@ -420,6 +505,40 @@ OPCODE_NAME = {
     OP_GETACC: "GETACC",
     OP_ACCADD: "ACCADD",
     OP_ACCSUB: "ACCSUB",
+    # New useful instructions
+    OP_XCHG: "XCHG",
+    OP_NEG: "NEG",
+    OP_SAR: "SAR",
+    OP_ROL: "ROL",
+    OP_ROR: "ROR",
+    OP_BT: "BT",
+    OP_BTS: "BTS",
+    OP_BTR: "BTR",
+    OP_BTC: "BTC",
+    OP_BSF: "BSF",
+    OP_BSR: "BSR",
+    OP_BSWAP: "BSWAP",
+    OP_CMOV: "CMOV",
+    OP_SETZ: "SETZ",
+    OP_SETNZ: "SETNZ",
+    OP_SETL: "SETL",
+    # Additional useful instructions
+    OP_MOVB: "MOVB",
+    OP_MOVW: "MOVW",
+    OP_LOADB: "LOADB",
+    OP_STOREB: "STOREB",
+    OP_SEXT: "SEXT",
+    OP_ZEXT: "ZEXT",
+    OP_POPCNT: "POPCNT",
+    # String and memory operations
+    OP_MEMCPY: "MEMCPY",
+    OP_MEMSET: "MEMSET",
+    OP_STRLEN: "STRLEN",
+    OP_STRCMP: "STRCMP",
+    OP_MIN: "MIN",
+    OP_MAX: "MAX",
+    OP_ABS: "ABS",
+    OP_CLAMP: "CLAMP",
 }
 NAME_OPCODE = {v: k for k, v in OPCODE_NAME.items()}
 # Instruction packing helpers
@@ -651,32 +770,309 @@ RET
 # ---------------------------
 class Memory:
     """
-    Byte-addressable memory that can be expanded or have regions registered.
-    For simplicity, regions are contiguous and we maintain a single bytearray that may grow.
+    Advanced byte-addressable memory with paging, memory protection,
+    and memory-mapped I/O support.
     """
     def __init__(self, size_bytes: int = DEFAULT_MEMORY_BYTES):
+        # Main memory storage
         self.data = bytearray(size_bytes)
         self.size = size_bytes
-        self.protected_regions = {}  # addr -> (size, permissions)
-        logger.debug("Memory initialized: %d bytes", self.size)
+        
+        # Memory management
+        self.page_size = 4096  # 4KB pages
+        self.page_table = {}   # Virtual to physical page mapping
+        self.memory_regions = []  # List of (start, end, permissions, name)
+        self.protected_regions = {}  # addr -> (size, permissions, name)
+        
+        # Memory-mapped I/O
+        self.mmio_handlers = {}  # addr_range -> handler_func
+        
+        # Cache
+        self.cache_enabled = True
+        self.cache = {}
+        self.cache_hits = 0
+        self.cache_misses = 0
+        
+        # Initialize default memory regions
+        self._init_default_regions()
+        logger.debug("Memory initialized: %d bytes (%d pages)", 
+                    self.size, self.size // self.page_size)
+    
+    def _init_default_regions(self):
+        """Initialize default memory regions"""
+        # Don't protect low memory by default - allow kernel loading
+        # The first 1MB is available for general use (bootloader, kernel, etc.)
+        # Only protect the actual BIOS area if needed
+        
+        # Reserve last 64KB for BIOS ROM (read-only)
+        bios_start = self.size - 0x10000
+        self.protected_regions[bios_start] = (0x10000, 0x1, "BIOS ROM")  # Read-only
+        
+        # Initialize page table identity mapping
+        self._init_page_table()
+    
+    def _init_page_table(self):
+        """Initialize identity page table mapping"""
+        num_pages = (self.size + self.page_size - 1) // self.page_size
+        for i in range(num_pages):
+            self.page_table[i] = i  # Identity mapping
+    
+    def map_page(self, vaddr: int, paddr: int, permissions: int = 0x7):
+        """Map a virtual page to a physical page"""
+        vpn = vaddr // self.page_size
+        ppn = paddr // self.page_size
+        self.page_table[vpn] = ppn
+        
+        # Update TLB if present
+        if hasattr(self, 'tlb'):
+            self.tlb.invalidate(vaddr)
+    
+    def unmap_page(self, vaddr: int):
+        """Unmap a virtual page"""
+        vpn = vaddr // self.page_size
+        if vpn in self.page_table:
+            del self.page_table[vpn]
+            # Invalidate TLB entry if present
+            if hasattr(self, 'tlb'):
+                self.tlb.invalidate(vaddr)
+    
+    def translate_address(self, vaddr: int) -> int:
+        """Translate virtual address to physical address"""
+        if not hasattr(self, 'paging_enabled') or not self.paging_enabled:
+            return vaddr  # Paging disabled, use physical addresses directly
+            
+        vpn = vaddr // self.page_size
+        offset = vaddr % self.page_size
+        
+        if vpn in self.page_table:
+            return (self.page_table[vpn] * self.page_size) + offset
+        
+        # Handle page fault
+        return self._handle_page_fault(vaddr)
+    
+    def _handle_page_fault(self, vaddr: int) -> int:
+        """Handle page fault by allocating a new page"""
+        # In a real system, this would involve:
+        # 1. Check if the access is valid
+        # 2. Load the page from disk if needed
+        # 3. Update page tables
+        # For now, just allocate a zeroed page
+        
+        vpn = vaddr // self.page_size
+        # Find a free physical page
+        used_pages = set(self.page_table.values())
+        for i in range(len(self.data) // self.page_size):
+            if i not in used_pages:
+                # Found free page, map it
+                self.page_table[vpn] = i
+                # Zero out the page
+                page_start = i * self.page_size
+                self.data[page_start:page_start + self.page_size] = bytes(self.page_size)
+                return (i * self.page_size) + (vaddr % self.page_size)
+        
+        # No free pages, raise out of memory
+        raise MemoryError(f"Out of memory: cannot allocate page for vaddr 0x{vaddr:08x}")
+    
+    def read_byte(self, addr: int) -> int:
+        """Read a byte from memory with address translation"""
+        # Check cache first if enabled
+        if self.cache_enabled and addr in self.cache:
+            self.cache_hits += 1
+            return self.cache[addr]
+            
+        # Handle MMIO
+        for (start, end), handler in self.mmio_handlers.items():
+            if start <= addr < end:
+                return handler.read_byte(addr - start)
+        
+        # Normal memory access
+        paddr = self.translate_address(addr)
+        self._check_bounds(paddr, 1)
+        
+        # Check memory protection
+        if not self._check_access(paddr, 1, False):
+            raise MemoryError(f"Read access violation at 0x{addr:08x}")
+        
+        val = self.data[paddr]
+        
+        # Update cache
+        if self.cache_enabled:
+            self.cache[addr] = val
+            self.cache_misses += 1
+            
+        return val
+    
+    def write_byte(self, addr: int, val: int):
+        """Write a byte to memory with address translation"""
+        # Handle MMIO
+        for (start, end), handler in self.mmio_handlers.items():
+            if start <= addr < end:
+                handler.write_byte(addr - start, val)
+                return
+        
+        # Normal memory access
+        paddr = self.translate_address(addr)
+        self._check_bounds(paddr, 1)
+        
+        # Check memory protection
+        if not self._check_access(paddr, 1, True):
+            raise MemoryError(f"Write access violation at 0x{addr:08x}")
+        
+        # Invalidate cache
+        if self.cache_enabled and addr in self.cache:
+            del self.cache[addr]
+        
+        self.data[paddr] = val & 0xFF
+    
+    def read_word(self, addr: int) -> int:
+        """Read a 32-bit word (little-endian) with proper alignment check"""
+        if addr % 4 != 0:
+            raise MemoryError(f"Unaligned word read at 0x{addr:08x}")
+        
+        # Optimize for aligned access
+        if self.cache_enabled and addr in self.cache:
+            self.cache_hits += 1
+            return self.cache[addr]
+            
+        # Handle MMIO
+        for (start, end), handler in self.mmio_handlers.items():
+            if start <= addr < end - 3:
+                return handler.read_word(addr - start)
+        
+        # Normal memory access
+        paddr = self.translate_address(addr)
+        self._check_bounds(paddr, 4)
+        
+        if not self._check_access(paddr, 4, False):
+            raise MemoryError(f"Read access violation at 0x{addr:08x}")
+        
+        # Read 4 bytes and pack into word
+        val = (self.data[paddr] | 
+              (self.data[paddr + 1] << 8) | 
+              (self.data[paddr + 2] << 16) | 
+              (self.data[paddr + 3] << 24))
+        
+        # Update cache
+        if self.cache_enabled:
+            self.cache[addr] = val
+            self.cache_misses += 1
+            
+        return val
+    
+    def write_word(self, addr: int, val: int):
+        """Write a 32-bit word (little-endian) with proper alignment check"""
+        if addr % 4 != 0:
+            raise MemoryError(f"Unaligned word write at 0x{addr:08x}")
+            
+        # Handle MMIO
+        for (start, end), handler in self.mmio_handlers.items():
+            if start <= addr < end - 3:
+                handler.write_word(addr - start, val)
+                return
+        
+        # Normal memory access
+        paddr = self.translate_address(addr)
+        self._check_bounds(paddr, 4)
+        
+        if not self._check_access(paddr, 4, True):
+            raise MemoryError(f"Write access violation at 0x{addr:08x}")
+        
+        # Invalidate cache
+        if self.cache_enabled:
+            for i in range(4):
+                if addr + i in self.cache:
+                    del self.cache[addr + i]
+        
+        # Write 4 bytes
+        self.data[paddr] = val & 0xFF
+        self.data[paddr + 1] = (val >> 8) & 0xFF
+        self.data[paddr + 2] = (val >> 16) & 0xFF
+        self.data[paddr + 3] = (val >> 24) & 0xFF
+    
+    def _check_bounds(self, addr: int, size: int):
+        """Check if address range is within bounds"""
+        if addr < 0 or addr + size > len(self.data):
+            raise MemoryError(f"Memory access out of bounds: 0x{addr:08x}-0x{addr+size-1:08x}")
+    
+    def _check_access(self, addr: int, size: int, write: bool) -> bool:
+        """Check if memory access is allowed"""
+        # Check protected regions
+        for start, (prot_size, prot_flags, _) in self.protected_regions.items():
+            if start <= addr < start + prot_size:
+                if write and not (prot_flags & 0x2):  # Write protection
+                    return False
+                if not write and not (prot_flags & 0x1):  # Read protection
+                    return False
+        return True
+    
+    def register_mmio(self, start: int, size: int, handler):
+        """Register a memory-mapped I/O handler"""
+        self.mmio_handlers[(start, start + size)] = handler
+    
+    def unregister_mmio(self, start: int, size: int):
+        """Unregister a memory-mapped I/O handler"""
+        key = (start, start + size)
+        if key in self.mmio_handlers:
+            del self.mmio_handlers[key]
+    
+    def protect_region(self, addr: int, size: int, flags: int, name: str = ""):
+        """Protect a region of memory
+        
+        Args:
+            addr: Start address of the region
+            size: Size of the region
+            flags: Protection flags (bit 0: read, bit 1: write, bit 2: execute)
+            name: Optional name for the region
+        """
+        self.protected_regions[addr] = (size, flags, name)
+    
+    def unprotect_region(self, addr: int):
+        """Remove protection from a memory region"""
+        if addr in self.protected_regions:
+            del self.protected_regions[addr]
+    
+    def get_memory_stats(self) -> dict:
+        """Get memory statistics"""
+        return {
+            'total': self.size,
+            'used': sum(len(region) for region in self.page_table.values()) * self.page_size,
+            'free': self.size - (len(self.page_table) * self.page_size),
+            'page_size': self.page_size,
+            'pages_used': len(self.page_table),
+            'pages_free': (self.size // self.page_size) - len(self.page_table),
+            'cache_hits': self.cache_hits,
+            'cache_misses': self.cache_misses,
+            'cache_ratio': (self.cache_hits / (self.cache_hits + self.cache_misses)) 
+                          if (self.cache_hits + self.cache_misses) > 0 else 0
+        }
     def check_address(self, addr: int, length: int = 1):
         if addr < 0 or addr + length > self.size:
             raise MemoryError(f"Memory access out of range: addr={addr} len={length} size={self.size}")
         # Check protection
-        for prot_addr, (prot_size, perms) in self.protected_regions.items():
+        for prot_addr, meta in self.protected_regions.items():
+            prot_size = meta[0]
+            perms = meta[1]
+            # Check if the access starts within this protected region
             if addr >= prot_addr and addr < prot_addr + prot_size:
                 if not (perms & 0x1):  # Read permission
                     raise MemoryError(f"Memory access violation: read protected at {addr:08x}")
-            if addr >= prot_addr and addr < prot_addr + prot_size:
+                # Only check boundary if the entire access is within the protected region
+                # Allow reads that start in one region and end in another
                 if length > 1 and addr + length > prot_addr + prot_size:
-                    raise MemoryError(f"Memory access violation: cross boundary at {addr:08x}")
+                    # Check if the overflow area is also readable
+                    end_addr = addr + length - 1
+                    # Only raise error if we're crossing into a non-existent area
+                    if end_addr >= self.size:
+                        raise MemoryError(f"Memory access violation: cross boundary at {addr:08x}")
     def read_byte(self, addr: int) -> int:
         self.check_address(addr, 1)
         return self.data[addr]
     def write_byte(self, addr: int, val: int):
         self.check_address(addr, 1)
         # Check write protection
-        for prot_addr, (prot_size, perms) in self.protected_regions.items():
+        for prot_addr, meta in self.protected_regions.items():
+            prot_size = meta[0]
+            perms = meta[1]
             if addr >= prot_addr and addr < prot_addr + prot_size:
                 if not (perms & 0x2):  # Write permission
                     raise MemoryError(f"Memory access violation: write protected at {addr:08x}")
@@ -687,7 +1083,9 @@ class Memory:
     def write_word(self, addr: int, val: int):
         self.check_address(addr, 4)
         # Check write protection
-        for prot_addr, (prot_size, perms) in self.protected_regions.items():
+        for prot_addr, meta in self.protected_regions.items():
+            prot_size = meta[0]
+            perms = meta[1]
             if addr >= prot_addr and addr < prot_addr + prot_size:
                 if not (perms & 0x2):  # Write permission
                     raise MemoryError(f"Memory access violation: write protected at {addr:08x}")
@@ -695,7 +1093,9 @@ class Memory:
     def load_bytes(self, addr: int, payload: bytes):
         self.check_expand(addr + len(payload))
         # Check write protection for the entire range
-        for prot_addr, (prot_size, perms) in self.protected_regions.items():
+        for prot_addr, meta in self.protected_regions.items():
+            prot_size = meta[0]
+            perms = meta[1]
             if addr >= prot_addr and addr < prot_addr + prot_size:
                 if not (perms & 0x2):  # Write permission
                     raise MemoryError(f"Memory access violation: write protected at {addr:08x}")
@@ -722,7 +1122,8 @@ class Memory:
         if addr < 0:
             raise MemoryError("Negative address")
         self.check_expand(addr + size)
-        self.protected_regions[addr] = (size, permissions)
+        # Store as (size, permissions, name) to be consistent with other entries
+        self.protected_regions[addr] = (size, permissions, "")
         logger.info("Registered memory region: %08x - %08x (perm=%x)", addr, addr + size - 1, permissions)
     def unregister_region(self, addr: int):
         """Unregister a memory region."""
@@ -732,6 +1133,29 @@ class Memory:
 
 # ---------------------------
 # Process Management
+# ---------------------------
+class ProcessState(IntEnum):
+    RUNNING = 1
+    READY = 2
+    BLOCKED = 3
+    TERMINATED = 4
+class Process:
+    def __init__(self, pid: int, name: str, entry_point: int, memory_size: int = 4096):
+        self.pid = pid
+        self.name = name
+        self.state = ProcessState.READY
+        self.entry_point = entry_point
+        self.memory_base = 0
+        self.memory_size = memory_size
+        self.registers = [0] * NUM_REGS
+        self.fpu_registers = [0.0] * NUM_FPU_REGS
+        self.pc = entry_point
+        self.flags = 0
+        self.stack_pointer = 0
+        self.priority = 10  # Lower number = higher priority
+        self.created_time = time.time()
+        self.cpu_time = 0.0
+
 # ---------------------------
 class ProcessState(IntEnum):
     RUNNING = 1
@@ -826,13 +1250,14 @@ class Kernel:
         self.next_pid = 2
         self.system_info = {
             "os_name": "SimpleOS",
-            "version": "2.0",
+            "version": "2.1",
             "architecture": "32-bit",
-            "features": ["FPU", "MMU", "Multitasking"]
+            "features": ["FPU", "MMU", "Multitasking", "Enhanced Memory", "Advanced Instructions"]
         }
-        self.env_vars: Dict[str, str] = {"USER": username, "HOME": "/home/" + username}
+        self.env_vars: Dict[str, str] = {"USER": username, "HOME": "/home/" + username, "PWD": "/"}
         self.command_history: List[str] = []
         self.start_time = time.time()
+        self.cwd = "/"  # Current working directory
         # seed some files
         self.files["/readme.txt"] = {
             "data": b"SimpleOS readme: use ls, cat, whoami, echo, write, loadasm, run\n",
@@ -1244,28 +1669,119 @@ class Kernel:
 # CPU core with syscall hook
 # ---------------------------
 class CPU:
+    """CPU emulator with x86-like architecture features including:
+    - 16 general purpose registers (R0-R15)
+    - 8 FPU registers (ST0-ST7)
+    - Full set of x86 flags
+    - Virtual memory support
+    - Hardware breakpoints
+    - Performance monitoring
+    - Power management
+    - Debugging support
+    - Virtualization extensions
+    """
     def __init__(self, memory: Optional[Memory] = None, kernel: Optional[Kernel] = None):
+        # Memory and I/O
         self.mem = memory if memory is not None else Memory()
+        self.ports = [0] * 65536  # I/O port space
+        
+        # Integer registers (32-bit)
         self.regs = [0] * NUM_REGS
+        self.acc = 0  # Accumulator register
+        
+        # FPU/MMX/SSE registers
         self.fpu_regs = [0.0] * NUM_FPU_REGS
-        # Dedicated accumulator register (separate from general regs)
-        self.acc = 0
-        # Simple Control Unit flags/state container
+        self.mmx_regs = [0] * 8  # 8x 64-bit MMX registers
+        self.xmm_regs = [[0] * 4 for _ in range(16)]  # 16x 128-bit XMM registers
+        
+        # System registers
+        self.cr0 = 0  # Start with paging disabled until properly initialized
+        self.cr0 |= CR0_NE  # Enable native FPU error handling
+        self.cr2 = 0  # Page Fault Linear Address
+        self.cr3 = 0  # Page Directory Base Register
+        self.cr4 = 0
+        self.efer = 0  # Extended Feature Enable Register
+        
+        # Segment registers (simplified)
+        # These will be initialized with proper values in the CPU init
+        self.cs = 0
+        self.ds = 0
+        self.es = 0
+        self.fs = 0
+        self.gs = 0
+        self.ss = 0
+        
+        # System tables
+        self.gdtr = 0  # GDT Register
+        self.idtr = 0  # IDT Register
+        self.ldtr = 0  # LDT Register
+        self.tr = 0    # Task Register
+        
+        # Control Unit state
         self.cu = {
             'running': True,
             'privileged': False,
+            'cpl': 0,  # Current Privilege Level (0-3)
+            'v8086': False,  # Virtual 8086 mode
+            'protected_mode': True,
+            'long_mode': False,
+            'pae': False,  # Physical Address Extension
+            'pse': False,  # Page Size Extension
         }
-        self.pc = 0
-        self.flags = 0
+        
+        # Program state
+        self.pc = 0  # Program Counter (EIP)
+        self.eflags = 0x202  # Default flags: IF=1, bit 1 is always 1
         self.halted = False
         self.tracing = False
-        self.kernel = kernel
-        self.interrupt_vector = [0] * 256  # Interrupt vector table
+        
+        # Interrupt handling
+        self.interrupt_vector = [0] * 256  # IDT entries
         self.interrupt_enabled = True
-        # initialize SP to top aligned
-        top_sp = (self.mem.size - 4) // 4 * 4
-        self.reg_write(REG_SP, top_sp)
-        logger.debug("CPU created: SP=%08x", self.reg_read(REG_SP))
+        self.nmi_enabled = True
+        self.pending_interrupts = []
+        self.in_interrupt = False
+        
+        # Debugging
+        self.breakpoints = set()
+        self.hw_breakpoints = [0] * 4  # Debug registers DR0-DR3
+        self.dr6 = 0  # Debug status
+        self.dr7 = 0  # Debug control
+        self.last_branch_from = 0
+        self.last_branch_to = 0
+        
+        # Performance monitoring
+        self.cycle_count = 0
+        self.instructions_retired = 0
+        self.cache_hits = 0
+        self.cache_misses = 0
+        
+        # Power management
+        self.cstates = [0] * 5  # C0-C4 states
+        self.pstates = [0] * 8  # P0-P7 states
+        self.thermal_status = 0
+        
+        # Virtualization
+        self.vmcs = {}  # Virtual Machine Control Structure
+        self.vm_control = 0
+        self.vmexit_reason = 0
+        
+        # System components
+        self.kernel = kernel
+        
+        # Initialize stack pointer to top of memory (aligned to 16 bytes)
+        top_sp = (self.mem.size - 16) & ~0xF
+        self.regs[REG_SP] = top_sp
+        
+        # Initialize segment registers with default selectors
+        self.cs = 0x08  # Kernel code segment (0x08 = 2nd GDT entry, RPL=0)
+        self.ds = 0x10  # Kernel data segment (0x10 = 3rd GDT entry, RPL=0)
+        self.es = 0x10
+        self.fs = 0x10
+        self.gs = 0x10
+        self.ss = 0x10  # Stack segment (same as data segment for now)
+        
+        logger.debug("CPU initialized: SP=%08x, PC=%08x", top_sp, self.pc)
     def reg_read(self, idx: int) -> int:
         if idx < 0 or idx >= NUM_REGS:
             raise IndexError("Register index out of range")
@@ -1282,14 +1798,105 @@ class CPU:
         if idx < 0 or idx >= NUM_FPU_REGS:
             raise IndexError("FPU register index out of range")
         self.fpu_regs[idx] = val
+    # Flag operations
     def set_flag(self, mask: int):
-        self.flags |= mask
+        """Set CPU flag(s)"""
+        self.eflags |= mask
+        
     def clear_flag(self, mask: int):
-        self.flags &= ~mask
+        """Clear CPU flag(s)"""
+        self.eflags &= ~mask
+        
     def test_flag(self, mask: int) -> bool:
-        return bool(self.flags & mask)
+        """Test if flag(s) are set"""
+        return bool(self.eflags & mask)
+        
+    def update_flags(self, result: int, width: int = 32):
+        """Update status flags after arithmetic/logical operation
+        
+        Args:
+            result: The result of the operation
+            width: Operand width in bits (8, 16, 32, or 64)
+        """
+        mask = (1 << width) - 1
+        signed_mask = 1 << (width - 1)
+        
+        # Zero Flag
+        if (result & mask) == 0:
+            self.set_flag(FLAG_ZF)
+        else:
+            self.clear_flag(FLAG_ZF)
+            
+        # Sign Flag
+        if (result & signed_mask) != 0:
+            self.set_flag(FLAG_SF)
+        else:
+            self.clear_flag(FLAG_SF)
+            
+        # Parity Flag (set if even number of set bits in low byte)
+        parity = bin(result & 0xFF).count('1') % 2 == 0
+        if parity:
+            self.set_flag(FLAG_PF)
+        else:
+            self.clear_flag(FLAG_PF)
+            
+    def update_arithmetic_flags(self, a: int, b: int, result: int, width: int = 32, 
+                              addition: bool = True):
+        """Update arithmetic flags (CF, OF, AF) after add/sub
+        
+        Args:
+            a: First operand
+            b: Second operand
+            result: Result of the operation
+            width: Operand width in bits
+            addition: True for addition, False for subtraction
+        """
+        mask = (1 << width) - 1
+        sign_bit = 1 << (width - 1)
+        
+        # Update basic flags
+        self.update_flags(result, width)
+        
+        # Carry Flag (unsigned overflow)
+        if addition:
+            carry = (a + b) > mask
+        else:
+            carry = (a < b)  # For subtraction, CF=1 if a < b
+            
+        if carry:
+            self.set_flag(FLAG_CF)
+        else:
+            self.clear_flag(FLAG_CF)
+            
+        # Overflow Flag (signed overflow)
+        a_signed = a & sign_bit
+        b_signed = b & sign_bit
+        r_signed = result & sign_bit
+        
+        if addition:
+            overflow = (a_signed == b_signed) and (r_signed != a_signed)
+        else:
+            overflow = (a_signed != b_signed) and (r_signed != a_signed)
+            
+        if overflow:
+            self.set_flag(FLAG_OF)
+        else:
+            self.clear_flag(FLAG_OF)
+            
+        # Auxiliary Carry Flag (carry from bit 3 to 4)
+        if addition:
+            af = ((a & 0xF) + (b & 0xF)) > 0xF
+        else:
+            af = (a & 0xF) < (b & 0xF)
+            
+        if af:
+            self.set_flag(FLAG_AF)
+        else:
+            self.clear_flag(FLAG_AF)
+    
     def update_zero_and_neg_flags(self, val: int):
-        if (val & 0xFFFFFFFF) == 0:
+        """Update zero and negative flags based on value"""
+        if val == 0:
             self.set_flag(FLAG_ZERO)
         else:
             self.clear_flag(FLAG_ZERO)
@@ -1305,12 +1912,22 @@ class CPU:
     def set_pc(self, val: int):
         self.pc = val & 0xFFFFFFFF
 
+    @property
+    def flags(self):
+        """Alias for eflags for backward compatibility"""
+        return self.eflags
+    
+    @flags.setter
+    def flags(self, value):
+        """Alias for eflags for backward compatibility"""
+        self.eflags = value
+    
     def reset(self):
         # Reset CPU state (not memory)
         self.regs = [0] * NUM_REGS
         self.fpu_regs = [0.0] * NUM_FPU_REGS
         self.acc = 0
-        self.flags = 0
+        self.eflags = 0
         self.pc = 0
         self.halted = False
 
@@ -1350,30 +1967,32 @@ class CPU:
         else:
             self.clear_flag(FLAG_CARRY)
         # overflow
-        if ((a ^ b) & (a ^ res)) & 0x80000000:
+        if ((a ^ b) & 0x80000000) != 0 and ((a ^ res) & 0x80000000) != 0:
             self.set_flag(FLAG_OVERFLOW)
         else:
             self.clear_flag(FLAG_OVERFLOW)
         self.update_zero_and_neg_flags(res)
         return res
-    # stack grows down
+
+    def fetch(self) -> int:
+        """Fetch the next instruction from memory at PC"""
+        if self.pc + 4 > self.mem.size:
+            raise MemoryError(f"PC out of bounds: {self.pc:08x}")
+        return self.mem.read_word(self.pc)
+
     def push_word(self, val: int):
-        sp = (self.reg_read(REG_SP) - 4) & 0xFFFFFFFF
-        if sp + 4 > self.mem.size:
-            raise MemoryError("Stack overflow")
-        self.reg_write(REG_SP, sp)
+        sp = self.reg_read(REG_SP)
+        sp = (sp - 4) & 0xFFFFFFFF
         self.mem.write_word(sp, val)
+        self.reg_write(REG_SP, sp)
+
     def pop_word(self) -> int:
         sp = self.reg_read(REG_SP)
-        if sp + 4 > self.mem.size:
-            raise MemoryError("Stack underflow")
         val = self.mem.read_word(sp)
-        self.reg_write(REG_SP, (sp + 4) & 0xFFFFFFFF)
+        sp = (sp + 4) & 0xFFFFFFFF
+        self.reg_write(REG_SP, sp)
         return val
-    def fetch(self) -> int:
-        if self.pc + 4 > self.mem.size:
-            raise MemoryError("PC out of memory range")
-        return self.mem.read_word(self.pc)
+
     def step(self):
         if self.halted:
             return
@@ -1403,31 +2022,20 @@ class CPU:
             self.reg_write(dst, val)
             self.update_zero_and_neg_flags(val)
         elif opcode == OP_STORE:
-            # Support STORE reg, [imm], STORE reg, [reg], and STORE reg, [reg+imm]
-            if src != 0 and imm16 != 0:
-                addr = (self.reg_read(src) + to_signed16(imm16)) & 0xFFFFFFFF
+            # Support STORE [imm], reg, STORE [reg], reg, and STORE [reg+imm], reg
+            if dst != 0 and imm16 != 0:
+                addr = (self.reg_read(dst) + to_signed16(imm16)) & 0xFFFFFFFF
             elif imm16 != 0:
                 addr = imm16
             else:
-                addr = self.reg_read(src)
-            val = self.reg_read(dst)  # dst field holds source reg for store
-            self.mem.write_word(addr, val)
+                addr = self.reg_read(dst)
+            self.mem.write_word(addr, self.reg_read(src))
         elif opcode == OP_ADD:
-            a = self.reg_read(dst)
-            if src == 0x0F:
-                b = to_signed16(imm16)
-            else:
-                b = self.reg_read(src)
-            res = self.alu_add(a, b)
-            self.reg_write(dst, res)
+            val = self.alu_add(self.reg_read(dst), self.reg_read(src))
+            self.reg_write(dst, val)
         elif opcode == OP_SUB:
-            a = self.reg_read(dst)
-            if src == 0x0F:
-                b = to_signed16(imm16)
-            else:
-                b = self.reg_read(src)
-            res = self.alu_sub(a, b)
-            self.reg_write(dst, res)
+            val = self.alu_sub(self.reg_read(dst), self.reg_read(src))
+            self.reg_write(dst, val)
         elif opcode == OP_AND:
             res = self.reg_read(dst) & self.reg_read(src)
             self.reg_write(dst, res)
@@ -1470,6 +2078,57 @@ class CPU:
         elif opcode == OP_JNE:
             if not self.test_flag(FLAG_ZERO):
                 next_pc = imm16
+        elif opcode == OP_JL:
+            # Jump if less (SF != OF)
+            if (self.test_flag(FLAG_NEG) != self.test_flag(FLAG_OVERFLOW)):
+                next_pc = imm16
+        elif opcode == OP_JG:
+            # Jump if greater (ZF=0 and SF=OF)
+            if not self.test_flag(FLAG_ZERO) and (self.test_flag(FLAG_NEG) == self.test_flag(FLAG_OVERFLOW)):
+                next_pc = imm16
+        elif opcode == OP_JLE:
+            # Jump if less or equal (ZF=1 or SF != OF)
+            if self.test_flag(FLAG_ZERO) or (self.test_flag(FLAG_NEG) != self.test_flag(FLAG_OVERFLOW)):
+                next_pc = imm16
+        elif opcode == OP_JGE:
+            # Jump if greater or equal (SF=OF)
+            if (self.test_flag(FLAG_NEG) == self.test_flag(FLAG_OVERFLOW)):
+                next_pc = imm16
+        elif opcode == OP_CMP:
+            a = self.reg_read(dst)
+            if src == 0x0F:
+                b = to_signed16(imm16) & 0xFFFFFFFF
+            else:
+                b = self.reg_read(src)
+            res = (a - b) & 0xFFFFFFFF
+            if res == 0:
+                self.set_flag(FLAG_ZERO)
+            else:
+                self.clear_flag(FLAG_ZERO)
+            if (res >> 31) & 1:
+                self.set_flag(FLAG_NEG)
+            else:
+                self.clear_flag(FLAG_NEG)
+            # Set overflow flag for signed comparison
+            if (a ^ b) & (a ^ res) & 0x80000000:
+                self.set_flag(FLAG_OVERFLOW)
+            else:
+                self.clear_flag(FLAG_OVERFLOW)
+        elif opcode == OP_TEST:
+            lhs = self.reg_read(dst)
+            if src == 0x0F:
+                rhs = to_signed16(imm16) & 0xFFFFFFFF
+            else:
+                rhs = self.reg_read(src)
+            res = lhs & rhs
+            if res == 0:
+                self.set_flag(FLAG_ZERO)
+            else:
+                self.clear_flag(FLAG_ZERO)
+            if (res >> 31) & 1:
+                self.set_flag(FLAG_NEG)
+            else:
+                self.clear_flag(FLAG_NEG)
         elif opcode == OP_JL:
             # Jump if less (SF != OF)
             if (self.test_flag(FLAG_NEG) != self.test_flag(FLAG_OVERFLOW)):
@@ -2152,6 +2811,268 @@ class CPU:
             else:
                 val = self.reg_read(src)
             self.acc = self.alu_sub(self.acc, val)
+        elif opcode == OP_XCHG:
+            # Exchange two registers
+            temp = self.reg_read(dst)
+            self.reg_write(dst, self.reg_read(src))
+            self.reg_write(src, temp)
+        elif opcode == OP_NEG:
+            # Negate (two's complement)
+            val = self.reg_read(dst)
+            res = ((~val) + 1) & 0xFFFFFFFF
+            self.reg_write(dst, res)
+            self.update_zero_and_neg_flags(res)
+            # Set carry if result is non-zero
+            if res != 0:
+                self.set_flag(FLAG_CARRY)
+            else:
+                self.clear_flag(FLAG_CARRY)
+        elif opcode == OP_SAR:
+            # Arithmetic right shift (sign-extending)
+            val = self.reg_read(dst)
+            bits = self.reg_read(src) & 0x1F
+            # Preserve sign bit
+            sign = (val >> 31) & 1
+            res = val >> bits
+            # Fill with sign bit
+            if sign:
+                mask = ((1 << bits) - 1) << (32 - bits)
+                res |= mask
+            res &= 0xFFFFFFFF
+            self.reg_write(dst, res)
+            self.update_zero_and_neg_flags(res)
+        elif opcode == OP_ROL:
+            # Rotate left
+            val = self.reg_read(dst)
+            bits = self.reg_read(src) & 0x1F
+            res = ((val << bits) | (val >> (32 - bits))) & 0xFFFFFFFF
+            self.reg_write(dst, res)
+            self.update_zero_and_neg_flags(res)
+        elif opcode == OP_ROR:
+            # Rotate right
+            val = self.reg_read(dst)
+            bits = self.reg_read(src) & 0x1F
+            res = ((val >> bits) | (val << (32 - bits))) & 0xFFFFFFFF
+            self.reg_write(dst, res)
+            self.update_zero_and_neg_flags(res)
+        elif opcode == OP_BT:
+            # Bit test - test bit position in src, set CF
+            val = self.reg_read(dst)
+            bit_pos = self.reg_read(src) & 0x1F
+            if (val >> bit_pos) & 1:
+                self.set_flag(FLAG_CARRY)
+            else:
+                self.clear_flag(FLAG_CARRY)
+        elif opcode == OP_BTS:
+            # Bit test and set
+            val = self.reg_read(dst)
+            bit_pos = self.reg_read(src) & 0x1F
+            if (val >> bit_pos) & 1:
+                self.set_flag(FLAG_CARRY)
+            else:
+                self.clear_flag(FLAG_CARRY)
+            val |= (1 << bit_pos)
+            self.reg_write(dst, val)
+        elif opcode == OP_BTR:
+            # Bit test and reset
+            val = self.reg_read(dst)
+            bit_pos = self.reg_read(src) & 0x1F
+            if (val >> bit_pos) & 1:
+                self.set_flag(FLAG_CARRY)
+            else:
+                self.clear_flag(FLAG_CARRY)
+            val &= ~(1 << bit_pos)
+            self.reg_write(dst, val)
+        elif opcode == OP_BTC:
+            # Bit test and complement
+            val = self.reg_read(dst)
+            bit_pos = self.reg_read(src) & 0x1F
+            if (val >> bit_pos) & 1:
+                self.set_flag(FLAG_CARRY)
+            else:
+                self.clear_flag(FLAG_CARRY)
+            val ^= (1 << bit_pos)
+            self.reg_write(dst, val)
+        elif opcode == OP_BSF:
+            # Bit scan forward - find first set bit (LSB to MSB)
+            val = self.reg_read(src)
+            if val == 0:
+                self.set_flag(FLAG_ZERO)
+                self.reg_write(dst, 0)
+            else:
+                self.clear_flag(FLAG_ZERO)
+                pos = 0
+                while pos < 32 and not ((val >> pos) & 1):
+                    pos += 1
+                self.reg_write(dst, pos)
+        elif opcode == OP_BSR:
+            # Bit scan reverse - find first set bit (MSB to LSB)
+            val = self.reg_read(src)
+            if val == 0:
+                self.set_flag(FLAG_ZERO)
+                self.reg_write(dst, 0)
+            else:
+                self.clear_flag(FLAG_ZERO)
+                pos = 31
+                while pos >= 0 and not ((val >> pos) & 1):
+                    pos -= 1
+                self.reg_write(dst, pos)
+        elif opcode == OP_BSWAP:
+            # Byte swap (reverse byte order)
+            val = self.reg_read(dst)
+            b0 = (val >> 24) & 0xFF
+            b1 = (val >> 16) & 0xFF
+            b2 = (val >> 8) & 0xFF
+            b3 = val & 0xFF
+            res = (b3 << 24) | (b2 << 16) | (b1 << 8) | b0
+            self.reg_write(dst, res)
+        elif opcode == OP_CMOV:
+            # Conditional move - move if zero flag is set
+            if self.test_flag(FLAG_ZERO):
+                self.reg_write(dst, self.reg_read(src))
+        elif opcode == OP_SETZ:
+            # Set register to 1 if zero flag is set, else 0
+            if self.test_flag(FLAG_ZERO):
+                self.reg_write(dst, 1)
+            else:
+                self.reg_write(dst, 0)
+        elif opcode == OP_SETNZ:
+            # Set register to 1 if zero flag is clear, else 0
+            if not self.test_flag(FLAG_ZERO):
+                self.reg_write(dst, 1)
+            else:
+                self.reg_write(dst, 0)
+        elif opcode == OP_SETL:
+            # Set register to 1 if less (SF != OF), else 0
+            if self.test_flag(FLAG_NEG) != self.test_flag(FLAG_OVERFLOW):
+                self.reg_write(dst, 1)
+            else:
+                self.reg_write(dst, 0)
+        elif opcode == OP_MOVB:
+            # Move byte (8-bit) - copy lower 8 bits
+            val = self.reg_read(src) & 0xFF
+            self.reg_write(dst, val)
+            self.update_zero_and_neg_flags(val)
+        elif opcode == OP_MOVW:
+            # Move word (16-bit) - copy lower 16 bits
+            val = self.reg_read(src) & 0xFFFF
+            self.reg_write(dst, val)
+            self.update_zero_and_neg_flags(val)
+        elif opcode == OP_LOADB:
+            # Load byte from memory
+            if src != 0 and imm16 != 0:
+                addr = (self.reg_read(src) + to_signed16(imm16)) & 0xFFFFFFFF
+            elif imm16 != 0:
+                addr = imm16
+            else:
+                addr = self.reg_read(src)
+            val = self.mem.read_byte(addr)
+            self.reg_write(dst, val)
+            self.update_zero_and_neg_flags(val)
+        elif opcode == OP_STOREB:
+            # Store byte to memory
+            if dst != 0 and imm16 != 0:
+                addr = (self.reg_read(dst) + to_signed16(imm16)) & 0xFFFFFFFF
+            elif imm16 != 0:
+                addr = imm16
+            else:
+                addr = self.reg_read(dst)
+            val = self.reg_read(src) & 0xFF
+            self.mem.write_byte(addr, val)
+        elif opcode == OP_SEXT:
+            # Sign extend byte to word
+            val = self.reg_read(src) & 0xFF
+            if val & 0x80:  # Sign bit set
+                val |= 0xFFFFFF00
+            self.reg_write(dst, val)
+            self.update_zero_and_neg_flags(val)
+        elif opcode == OP_ZEXT:
+            # Zero extend byte to word
+            val = self.reg_read(src) & 0xFF
+            self.reg_write(dst, val)
+            self.update_zero_and_neg_flags(val)
+        elif opcode == OP_POPCNT:
+            # Population count - count number of set bits
+            val = self.reg_read(src)
+            count = 0
+            for i in range(32):
+                if (val >> i) & 1:
+                    count += 1
+            self.reg_write(dst, count)
+            self.update_zero_and_neg_flags(count)
+        elif opcode == OP_MIN:
+            # Minimum of two values (signed)
+            a = to_signed32(self.reg_read(dst))
+            b = to_signed32(self.reg_read(src))
+            result = min(a, b) & 0xFFFFFFFF
+            self.reg_write(dst, result)
+            self.update_zero_and_neg_flags(result)
+        elif opcode == OP_MAX:
+            # Maximum of two values (signed)
+            a = to_signed32(self.reg_read(dst))
+            b = to_signed32(self.reg_read(src))
+            result = max(a, b) & 0xFFFFFFFF
+            self.reg_write(dst, result)
+            self.update_zero_and_neg_flags(result)
+        elif opcode == OP_ABS:
+            # Absolute value
+            val = to_signed32(self.reg_read(src))
+            result = abs(val) & 0xFFFFFFFF
+            self.reg_write(dst, result)
+            self.update_zero_and_neg_flags(result)
+        elif opcode == OP_MEMCPY:
+            # Memory copy: R0=dst_addr, R1=src_addr, R2=length
+            dst_addr = self.reg_read(0) & 0xFFFFFFFF
+            src_addr = self.reg_read(1) & 0xFFFFFFFF
+            length = self.reg_read(2) & 0xFFFFFFFF
+            for i in range(length):
+                byte = self.mem.read_byte((src_addr + i) & 0xFFFFFFFF)
+                self.mem.write_byte((dst_addr + i) & 0xFFFFFFFF, byte)
+        elif opcode == OP_MEMSET:
+            # Memory set: R0=dst_addr, R1=value, R2=length
+            dst_addr = self.reg_read(0) & 0xFFFFFFFF
+            value = self.reg_read(1) & 0xFF
+            length = self.reg_read(2) & 0xFFFFFFFF
+            for i in range(length):
+                self.mem.write_byte((dst_addr + i) & 0xFFFFFFFF, value)
+        elif opcode == OP_STRLEN:
+            # String length: R0=string_addr, result in dst
+            addr = self.reg_read(0) & 0xFFFFFFFF
+            length = 0
+            while length < 65536:  # Safety limit
+                byte = self.mem.read_byte((addr + length) & 0xFFFFFFFF)
+                if byte == 0:
+                    break
+                length += 1
+            self.reg_write(dst, length)
+        elif opcode == OP_STRCMP:
+            # String compare: R0=str1_addr, R1=str2_addr, result in dst
+            addr1 = self.reg_read(0) & 0xFFFFFFFF
+            addr2 = self.reg_read(1) & 0xFFFFFFFF
+            i = 0
+            result = 0
+            while i < 65536:  # Safety limit
+                b1 = self.mem.read_byte((addr1 + i) & 0xFFFFFFFF)
+                b2 = self.mem.read_byte((addr2 + i) & 0xFFFFFFFF)
+                if b1 != b2:
+                    result = 1 if b1 > b2 else -1
+                    break
+                if b1 == 0:  # Both strings ended
+                    break
+                i += 1
+            self.reg_write(dst, result & 0xFFFFFFFF)
+            if result == 0:
+                self.set_flag(FLAG_ZERO)
+            else:
+                self.clear_flag(FLAG_ZERO)
+        elif opcode == OP_CLAMP:
+            # Clamp value: dst = clamp(dst, R0=min, R1=max)
+            val = to_signed32(self.reg_read(dst))
+            min_val = to_signed32(self.reg_read(0))
+            max_val = to_signed32(self.reg_read(1))
+            result = max(min_val, min(max_val, val)) & 0xFFFFFFFF
+            self.reg_write(dst, result)
+            self.update_zero_and_neg_flags(result)
         else:
             raise NotImplementedError(f"Opcode {opcode:02x} not implemented")
         self.pc = next_pc & 0xFFFFFFFF
@@ -2543,7 +3464,10 @@ class Shell:
         print("Welcome to SimpleOS shell. Type 'help' for commands.")
         while True:
             try:
-                line = input("simpleos> ")
+                # Show current directory in prompt
+                prompt_dir = self.kernel.cwd if self.kernel.cwd != "/" else ""
+                prompt = f"simpleos{prompt_dir}> "
+                line = input(prompt)
             except EOFError:
                 print()
                 break
@@ -2556,11 +3480,87 @@ class Shell:
             args = parts[1:]
             try:
                 if cmd == "help":
-                    print(textwrap.dedent(self.__doc__))
+                    if not args:
+                        # Show command categories
+                        print("Available command categories:")
+                        print("  system    - System and process management commands")
+                        print("  file      - File operations and management")
+                        print("  memory    - Memory and CPU operations")
+                        print("  network   - Network simulation commands")
+                        print("  util      - Utility commands")
+                        print("\nUse 'help <category>' to see specific commands.")
+                        # continue main loop (don't exit shell)
+                        continue
+                        
+                    category = args[0].lower()
+                    if category == "system":
+                        print("System Commands:")
+                        print("  ps        - List processes")
+                        print("  kill      - Kill a process")
+                        print("  reboot    - Reboot the system")
+                        print("  sysinfo   - Show system information")
+                        print("  uptime    - Show system uptime")
+                        print("  top       - Show process information")
+                        print("  date      - Show current date")
+                        print("  time      - Show current time")
+                        print("  bios      - Show BIOS information")
+                        print("  sleep     - Delay execution")
+                        print("  ver       - Show version information")
+                    elif category == "file":
+                        print("File Commands:")
+                        print("  ls        - List files")
+                        print("  cd        - Change directory")
+                        print("  pwd       - Print working directory")
+                        print("  cat       - Display file contents")
+                        print("  nano      - Text editor (like nano)")
+                        print("  write     - Write text to file")
+                        print("  mkdir     - Create directory")
+                        print("  rm        - Remove file")
+                        print("  cp        - Copy file")
+                        print("  mv        - Move file")
+                        print("  chmod     - Change file permissions")
+                        print("  stat      - Show file information")
+                        print("  type      - Print file contents")
+                        print("  find      - Search for files")
+                        print("  grep      - Search within files")
+                        print("  wc        - Count lines/words/chars")
+                    elif category == "memory":
+                        print("Memory Commands:")
+                        print("  memmap    - Map memory region")
+                        print("  regs      - Show CPU registers")
+                        print("  disasm    - Disassemble memory")
+                        print("  debug     - Enable/disable CPU tracing")
+                        print("  trace     - Trace execution")
+                        print("  loadasm   - Load assembly program")
+                        print("  run       - Execute program")
+                    elif category == "network":
+                        print("Network Commands:")
+                        print("  ping      - Test connectivity")
+                        print("  curl      - Simulate HTTP request")
+                        print("  wget      - Download simulation")
+                    elif category == "util":
+                        print("Utility Commands:")
+                        print("  echo      - Print text")
+                        print("  whoami    - Show current user")
+                        print("  clear/cls - Clear screen")
+                        print("  calc      - Basic calculator")
+                        print("  history   - Show command history")
+                        print("  set       - Set environment variable")
+                        print("  get       - Get environment variable")
+                        print("  exit/quit - Exit the shell")
+                    else:
+                        print(f"Unknown category: {category}")
+                        print("Use 'help' for list of categories.")
                 elif cmd == "ls":
                     self.do_ls(args)
+                elif cmd == "cd":
+                    self.do_cd(args)
+                elif cmd == "pwd":
+                    print(self.kernel.cwd)
                 elif cmd == "cat":
                     self.do_cat(args)
+                elif cmd == "nano":
+                    self.do_nano(args)
                 elif cmd == "whoami":
                     print(self.kernel.username)
                 elif cmd == "echo":
@@ -2692,7 +3692,7 @@ class Shell:
         return False
     def do_ls(self, args):
         long_format = False
-        path = "/"
+        path = self.kernel.cwd  # Use current working directory
         if args:
             if args[0] == "-l":
                 long_format = True
@@ -2700,20 +3700,44 @@ class Shell:
                     path = args[1]
             else:
                 path = args[0]
+        
+        # Normalize path
+        if not path.startswith("/"):
+            if self.kernel.cwd == "/":
+                path = "/" + path
+            else:
+                path = self.kernel.cwd + "/" + path
+        
+        # Ensure path ends with / for directory listing
+        if not path.endswith("/"):
+            path += "/"
+        
         if long_format:
             print(f"{'Mode':<10} {'Size':<8} {'Created':<20} {'Modified':<20} {'Name'}")
             for name, info in sorted(self.kernel.files.items()):
-                if name.startswith(path):
-                    mode_str = "rwxrwxrwx"  # Simplified
-                    size = len(info["data"])
-                    created = time.ctime(info["created_time"])
-                    modified = time.ctime(info["modified_time"])
-                    print(f"{mode_str:<10} {size:<8} {created:<20} {modified:<20} {name}")
+                # Show files in current directory only
+                if name.startswith(path) or (path == "/" and name.startswith("/")):
+                    # Don't show subdirectory contents
+                    rel_path = name[len(path):] if name.startswith(path) else name[1:]
+                    if "/" not in rel_path or path == "/":
+                        mode_str = "rwxrwxrwx"  # Simplified
+                        size = len(info["data"])
+                        created = time.ctime(info["created_time"])
+                        modified = time.ctime(info["modified_time"])
+                        print(f"{mode_str:<10} {size:<8} {created:<20} {modified:<20} {name}")
         else:
             for name in sorted(self.kernel.files.keys()):
-                if name.startswith(path):
+                # Show files in current directory only
+                if path == "/" and name.startswith("/"):
+                    # Root directory - show all files
                     size = len(self.kernel.files[name]["data"])
                     print(f"{name}\t{size} bytes")
+                elif name.startswith(path) and path != "/":
+                    # Subdirectory - show only files in this directory
+                    rel_path = name[len(path):]
+                    if "/" not in rel_path:
+                        size = len(self.kernel.files[name]["data"])
+                        print(f"{name}\t{size} bytes")
     def do_cat(self, args):
         if not args:
             print("Usage: cat <file>")
@@ -2727,6 +3751,107 @@ class Shell:
             print(data.decode("utf-8", errors="replace"))
         except Exception:
             print(data)
+    
+    def do_cd(self, args):
+        """Change directory"""
+        if not args:
+            # Go to home directory
+            self.kernel.cwd = self.kernel.env_vars.get("HOME", "/")
+            self.kernel.env_vars["PWD"] = self.kernel.cwd
+            return
+        path = args[0]
+        if path == "..":
+            # Go up one directory
+            if self.kernel.cwd != "/":
+                self.kernel.cwd = "/" + "/".join(self.kernel.cwd.strip("/").split("/")[:-1])
+                if not self.kernel.cwd:
+                    self.kernel.cwd = "/"
+        elif path.startswith("/"):
+            # Absolute path
+            self.kernel.cwd = path
+        else:
+            # Relative path
+            if self.kernel.cwd == "/":
+                self.kernel.cwd = "/" + path
+            else:
+                self.kernel.cwd = self.kernel.cwd + "/" + path
+        # Normalize path
+        self.kernel.cwd = "/" + "/".join(p for p in self.kernel.cwd.split("/") if p)
+        if not self.kernel.cwd:
+            self.kernel.cwd = "/"
+        self.kernel.env_vars["PWD"] = self.kernel.cwd
+        print(f"Changed directory to: {self.kernel.cwd}")
+    
+    def do_nano(self, args):
+        """Simple text editor similar to nano"""
+        if not args:
+            print("Usage: nano <file>")
+            return
+        filename = args[0]
+        
+        # Load existing file or create new
+        if filename in self.kernel.files:
+            try:
+                content = self.kernel.files[filename]["data"].decode("utf-8", errors="replace")
+            except:
+                print("Error: Cannot edit binary file")
+                return
+        else:
+            content = ""
+        
+        print(f"Nano Editor - Editing: {filename}")
+        print("=" * 60)
+        print("Commands: :w (save), :q (quit), :wq (save & quit)")
+        print("Enter text (empty line + :command to execute)")
+        print("=" * 60)
+        
+        lines = content.split("\n") if content else []
+        
+        # Display current content
+        if lines:
+            print("\nCurrent content:")
+            for i, line in enumerate(lines, 1):
+                print(f"{i:3}: {line}")
+        
+        print("\nEnter new content (type :w to save, :q to quit, :wq to save & quit):")
+        
+        new_lines = []
+        while True:
+            try:
+                line = input()
+                if line == ":w":
+                    # Save
+                    new_content = "\n".join(new_lines)
+                    self.kernel.files[filename] = {
+                        "data": new_content.encode("utf-8"),
+                        "permissions": 0o644,
+                        "created_time": self.kernel.files.get(filename, {}).get("created_time", time.time()),
+                        "modified_time": time.time()
+                    }
+                    print(f"Saved {len(new_content)} bytes to {filename}")
+                elif line == ":q":
+                    # Quit without saving
+                    print("Quit without saving")
+                    break
+                elif line == ":wq":
+                    # Save and quit
+                    new_content = "\n".join(new_lines)
+                    self.kernel.files[filename] = {
+                        "data": new_content.encode("utf-8"),
+                        "permissions": 0o644,
+                        "created_time": self.kernel.files.get(filename, {}).get("created_time", time.time()),
+                        "modified_time": time.time()
+                    }
+                    print(f"Saved {len(new_content)} bytes to {filename}")
+                    break
+                else:
+                    new_lines.append(line)
+            except EOFError:
+                break
+            except KeyboardInterrupt:
+                print("\nAborted")
+                break
+    
     def do_write(self, args):
         if len(args) < 2:
             print("Usage: write <file> <text...>")
@@ -2746,9 +3871,14 @@ class Shell:
             return
         src = args[0]
         dest = args[1]
+        
+        # Read from virtual filesystem
+        if src not in self.kernel.files:
+            print(f"Error: File '{src}' not found in filesystem")
+            return
+        
         try:
-            with open(src, "r") as f:
-                asm_text = f.read()
+            asm_text = self.kernel.files[src]["data"].decode("utf-8")
         except Exception as e:
             print("Error reading assembly file:", e)
             return
@@ -2766,8 +3896,24 @@ class Shell:
         print(f"Stored {len(binary)} bytes to {dest}")
     def do_run(self, args):
         if not args:
-            print("Usage: run <file> [addr]")
+            print("Usage: run <file> [addr] [--debug] [--output] [--trace]")
+            print("  --debug   : Show detailed execution information")
+            print("  --output  : Show all register changes and output")
+            print("  --trace   : Enable instruction tracing")
             return
+        
+        # Parse flags
+        debug_mode = "--debug" in args
+        output_mode = "--output" in args
+        trace_mode = "--trace" in args
+        
+        # Remove flags from args
+        args = [arg for arg in args if not arg.startswith("--")]
+        
+        if not args:
+            print("Error: No filename specified")
+            return
+            
         fname = args[0]
         addr = 0x0000
         if len(args) > 1:
@@ -2785,14 +3931,47 @@ class Shell:
         except Exception as e:
             print("Error loading file to memory:", e)
             return 0
+        
+        # Save initial state for debug mode
+        if debug_mode or output_mode:
+            initial_regs = [self.cpu.reg_read(i) for i in range(NUM_REGS)]
+        
         self.cpu.pc = addr
         self.cpu.halted = False
         self.cpu.reg_write(REG_SP, (self.cpu.mem.size - 4) // 4 * 4)
-        print(f"Executing {fname} at {addr:08x} (size {len(data)} bytes).")
+        
+        if debug_mode:
+            print(f"=== DEBUG MODE ===")
+            print(f"File: {fname}")
+            print(f"Load Address: {addr:08x}")
+            print(f"Size: {len(data)} bytes")
+            print(f"Initial PC: {self.cpu.pc:08x}")
+            print(f"Initial SP: {self.cpu.reg_read(REG_SP):08x}")
+            print("=" * 50)
+        else:
+            print(f"Executing {fname} at {addr:08x} (size {len(data)} bytes).")
+        
         try:
-            self.cpu.run()
+            self.cpu.run(trace=trace_mode)
         except Exception as e:
             print("Execution error:", e)
+            if debug_mode:
+                import traceback
+                traceback.print_exc()
+        
+        # Show output mode results
+        if output_mode or debug_mode:
+            print("\n=== EXECUTION RESULTS ===")
+            print(f"Final PC: {self.cpu.pc:08x}")
+            print(f"Final SP: {self.cpu.reg_read(REG_SP):08x}")
+            print(f"Flags: {self.cpu.flags:08x}")
+            print("\nRegister Changes:")
+            for i in range(NUM_REGS):
+                final_val = self.cpu.reg_read(i)
+                if output_mode or (debug_mode and final_val != initial_regs[i]):
+                    print(f"  R{i}: {initial_regs[i]:08x} -> {final_val:08x}")
+            print("=" * 50)
+        
         # Check if it was a reboot signal
         if self.cpu.reg_read(0) == 0xDEADBEEF:
             print("\n[Reboot signal received]")
@@ -3538,6 +4717,7 @@ class Shell:
 # ---------------------------
 # Sample assembly programs
 # ---------------------------
+
 # Let's create a simple, non-empty sample program
 SAMPLE_HELLO_ASM = r"""
 .org 0x0000
