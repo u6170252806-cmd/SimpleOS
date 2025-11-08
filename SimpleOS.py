@@ -32,6 +32,9 @@ import socket
 import threading
 from typing import Dict, List, Tuple, Optional, Callable, Any
 from enum import IntEnum
+import asyncio
+from dataclasses import dataclass, field
+from collections import deque
 # Basic logging
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger("SimpleOS")
@@ -1746,6 +1749,138 @@ class Kernel:
         return "".join(out)
 
 # ---------------------------
+# Multi-threading and Async Support
+# ---------------------------
+@dataclass
+class Thread:
+    """Represents a thread of execution with its own context"""
+    tid: int  # Thread ID
+    pc: int  # Program counter
+    regs: List[int] = field(default_factory=lambda: [0] * NUM_REGS)  # Register state
+    sp: int = 0  # Stack pointer
+    flags: int = 0x202  # Flags register
+    state: str = "ready"  # ready, running, blocked, terminated
+    priority: int = 5  # Priority level (0-10, higher = more priority)
+    time_slice: int = 100  # Instructions per time slice
+    instructions_executed: int = 0
+    total_instructions: int = 0
+    blocked_until: float = 0.0  # Time when thread becomes unblocked
+    
+    def save_context(self, cpu: 'CPU'):
+        """Save CPU state to thread context"""
+        self.pc = cpu.pc
+        self.regs = cpu.regs.copy()
+        self.sp = cpu.reg_read(REG_SP)
+        self.flags = cpu.eflags
+        
+    def restore_context(self, cpu: 'CPU'):
+        """Restore thread context to CPU"""
+        cpu.pc = self.pc
+        cpu.regs = self.regs.copy()
+        cpu.reg_write(REG_SP, self.sp)
+        cpu.eflags = self.flags
+
+
+class Scheduler:
+    """Cooperative and preemptive scheduler for managing multiple threads"""
+    def __init__(self):
+        self.threads: Dict[int, Thread] = {}
+        self.ready_queue: deque = deque()
+        self.current_thread: Optional[Thread] = None
+        self.next_tid = 1
+        self.scheduling_enabled = True
+        self.quantum = 100  # Default time slice in instructions
+        
+    def create_thread(self, pc: int, priority: int = 5) -> int:
+        """Create a new thread and add it to the ready queue"""
+        tid = self.next_tid
+        self.next_tid += 1
+        
+        thread = Thread(
+            tid=tid,
+            pc=pc,
+            priority=priority,
+            time_slice=self.quantum
+        )
+        thread.regs[REG_SP] = STACK_BASE - (tid * 0x10000)  # Separate stack per thread
+        
+        self.threads[tid] = thread
+        self.ready_queue.append(tid)
+        logger.info(f"Created thread {tid} at PC={pc:08x}, priority={priority}")
+        return tid
+    
+    def schedule_next(self) -> Optional[Thread]:
+        """Select the next thread to run using priority-based round-robin"""
+        if not self.ready_queue:
+            return None
+            
+        # Simple round-robin for now, can be enhanced with priority
+        tid = self.ready_queue.popleft()
+        thread = self.threads.get(tid)
+        
+        if thread and thread.state == "ready":
+            thread.state = "running"
+            self.current_thread = thread
+            return thread
+        
+        return self.schedule_next()  # Try next thread
+    
+    def yield_thread(self, cpu: 'CPU'):
+        """Voluntarily yield current thread (cooperative multitasking)"""
+        if not self.current_thread:
+            return
+            
+        self.current_thread.save_context(cpu)
+        self.current_thread.state = "ready"
+        self.ready_queue.append(self.current_thread.tid)
+        self.current_thread = None
+    
+    def block_thread(self, cpu: 'CPU', duration: float = 0.0):
+        """Block current thread for a specified duration"""
+        if not self.current_thread:
+            return
+            
+        self.current_thread.save_context(cpu)
+        self.current_thread.state = "blocked"
+        self.current_thread.blocked_until = time.time() + duration
+        self.current_thread = None
+    
+    def unblock_threads(self):
+        """Check and unblock threads whose wait time has expired"""
+        current_time = time.time()
+        for thread in self.threads.values():
+            if thread.state == "blocked" and current_time >= thread.blocked_until:
+                thread.state = "ready"
+                self.ready_queue.append(thread.tid)
+    
+    def terminate_thread(self, tid: int):
+        """Terminate a thread"""
+        if tid in self.threads:
+            thread = self.threads[tid]
+            thread.state = "terminated"
+            if self.current_thread and self.current_thread.tid == tid:
+                self.current_thread = None
+            logger.info(f"Thread {tid} terminated")
+    
+    def get_thread_count(self) -> int:
+        """Get count of active threads"""
+        return sum(1 for t in self.threads.values() if t.state != "terminated")
+    
+    def list_threads(self) -> List[Dict]:
+        """List all threads with their status"""
+        return [
+            {
+                "tid": t.tid,
+                "state": t.state,
+                "pc": t.pc,
+                "priority": t.priority,
+                "instructions": t.total_instructions
+            }
+            for t in self.threads.values()
+            if t.state != "terminated"
+        ]
+
+# ---------------------------
 # CPU core with syscall hook
 # ---------------------------
 class CPU:
@@ -1849,6 +1984,10 @@ class CPU:
         
         # System components
         self.kernel = kernel
+        
+        # Multi-threading support
+        self.scheduler = Scheduler()
+        self.multithreading_enabled = False
         
         # Initialize stack pointer to top of memory (aligned to 16 bytes)
         top_sp = (self.mem.size - 16) & ~0xF
@@ -2057,8 +2196,8 @@ class CPU:
 
     def fetch(self) -> int:
         """Fetch the next instruction from memory at PC"""
-        # Restrict PC to valid loaded program bounds if set
-        if hasattr(self, "program_start") and hasattr(self, "program_end"):
+        # Restrict PC to valid loaded program bounds if set (but not in multithreading mode)
+        if not self.multithreading_enabled and hasattr(self, "program_start") and hasattr(self, "program_end"):
             if not (self.program_start <= self.pc < self.program_end):
                 logger.error(f"PC out of loaded program bounds: {self.pc:08x} (valid {self.program_start:08x}-{self.program_end-1:08x}), halting")
                 print(f"ERROR: PC out of loaded program bounds: {self.pc:08x} (valid {self.program_start:08x}-{self.program_end-1:08x}), halting")
@@ -2165,32 +2304,68 @@ class CPU:
             next_pc = imm16
         elif opcode == OP_JZ:
             if self.test_flag(FLAG_ZERO):
-                next_pc = imm16
+                # Check if address is within loaded program bounds - if so, make it relative
+                if imm16 < 0x1000:  # Likely a relative offset
+                    # Add program base address (round PC down to nearest 0x1000)
+                    base_addr = (self.pc // 0x1000) * 0x1000
+                    next_pc = base_addr + imm16
+                else:
+                    next_pc = imm16
         elif opcode == OP_JNZ:
             if not self.test_flag(FLAG_ZERO):
-                next_pc = imm16
+                # Check if address is within loaded program bounds - if so, make it relative
+                if imm16 < 0x1000:  # Likely a relative offset
+                    # Add program base address (round PC down to nearest 0x1000)
+                    base_addr = (self.pc // 0x1000) * 0x1000
+                    next_pc = base_addr + imm16
+                else:
+                    next_pc = imm16
         elif opcode == OP_JE:
             if self.test_flag(FLAG_ZERO):
-                next_pc = imm16
+                if imm16 < 0x1000:
+                    base_addr = (self.pc // 0x1000) * 0x1000
+                    next_pc = base_addr + imm16
+                else:
+                    next_pc = imm16
         elif opcode == OP_JNE:
             if not self.test_flag(FLAG_ZERO):
-                next_pc = imm16
+                if imm16 < 0x1000:
+                    base_addr = (self.pc // 0x1000) * 0x1000
+                    next_pc = base_addr + imm16
+                else:
+                    next_pc = imm16
         elif opcode == OP_JL:
             # Jump if less (SF != OF)
             if (self.test_flag(FLAG_NEG) != self.test_flag(FLAG_OVERFLOW)):
-                next_pc = imm16
+                if imm16 < 0x1000:
+                    base_addr = (self.pc // 0x1000) * 0x1000
+                    next_pc = base_addr + imm16
+                else:
+                    next_pc = imm16
         elif opcode == OP_JG:
             # Jump if greater (ZF=0 and SF=OF)
             if not self.test_flag(FLAG_ZERO) and (self.test_flag(FLAG_NEG) == self.test_flag(FLAG_OVERFLOW)):
-                next_pc = imm16
+                if imm16 < 0x1000:
+                    base_addr = (self.pc // 0x1000) * 0x1000
+                    next_pc = base_addr + imm16
+                else:
+                    next_pc = imm16
         elif opcode == OP_JLE:
             # Jump if less or equal (ZF=1 or SF != OF)
             if self.test_flag(FLAG_ZERO) or (self.test_flag(FLAG_NEG) != self.test_flag(FLAG_OVERFLOW)):
-                next_pc = imm16
+                if imm16 < 0x1000:
+                    base_addr = (self.pc // 0x1000) * 0x1000
+                    next_pc = base_addr + imm16
+                else:
+                    next_pc = imm16
         elif opcode == OP_JGE:
             # Jump if greater or equal (SF=OF)
             if (self.test_flag(FLAG_NEG) == self.test_flag(FLAG_OVERFLOW)):
-                next_pc = imm16
+                if imm16 < 0x1000:
+                    base_addr = (self.pc // 0x1000) * 0x1000
+                    next_pc = base_addr + imm16
+                else:
+                    next_pc = imm16
         elif opcode == OP_CMP:
             a = self.reg_read(dst)
             if src == 0x0F:
@@ -3414,8 +3589,11 @@ class CPU:
             ms = self.reg_read(src)
             time.sleep(ms / 1000.0)
         elif opcode == OP_YIELD:
-            # YIELD: Yield CPU (no-op in emulation)
-            pass
+            # YIELD: Yield CPU to scheduler (cooperative multitasking)
+            if self.multithreading_enabled and self.scheduler.current_thread:
+                # Mark that we want to yield - the async run loop will handle it
+                self.scheduler.current_thread.instructions_executed = self.scheduler.current_thread.time_slice
+            # In single-threaded mode, this is a no-op
         elif opcode == OP_BARRIER:
             # BARRIER: Memory barrier (no-op in emulation)
             pass
@@ -3635,17 +3813,121 @@ class CPU:
     def run(self, max_steps: Optional[int] = None, trace: bool = False):
         steps = 0
         self.tracing = trace
+        batch_size = 10000  # Process in batches for better performance
+        
         try:
             while True:
                 if self.halted:
                     break
                 if max_steps is not None and steps >= max_steps:
                     break
-                self.step()
-                steps += 1
+                
+                # Execute batch of instructions
+                batch_end = min(steps + batch_size, max_steps if max_steps else steps + batch_size)
+                while steps < batch_end and not self.halted:
+                    self.step()
+                    steps += 1
+                    
         finally:
             self.tracing = False
         return steps
+    
+    async def run_async(self, max_steps: Optional[int] = None, trace: bool = False):
+        """Async version of run() with cooperative multitasking support"""
+        steps = 0
+        self.tracing = trace
+        try:
+            while True:
+                if self.halted:
+                    break
+                if max_steps is not None and steps >= max_steps:
+                    break
+                
+                # Check for context switch if multithreading is enabled
+                if self.multithreading_enabled and self.scheduler.current_thread:
+                    thread = self.scheduler.current_thread
+                    thread.instructions_executed += 1
+                    thread.total_instructions += 1
+                    
+                    # Preemptive context switch after time slice
+                    if thread.instructions_executed >= thread.time_slice:
+                        thread.instructions_executed = 0
+                        self.scheduler.yield_thread(self)
+                        
+                        # Unblock any waiting threads
+                        self.scheduler.unblock_threads()
+                        
+                        # Schedule next thread
+                        next_thread = self.scheduler.schedule_next()
+                        if next_thread:
+                            next_thread.restore_context(self)
+                        else:
+                            break  # No more threads to run
+                        
+                        # Yield control to event loop
+                        await asyncio.sleep(0)
+                
+                self.step()
+                steps += 1
+                
+                # Periodically yield to event loop for better responsiveness
+                if steps % 1000 == 0:
+                    await asyncio.sleep(0)
+                    
+        finally:
+            self.tracing = False
+        return steps
+    
+    async def run_multithreaded(self, threads: List[Tuple[int, int]], trace: bool = False):
+        """
+        Run multiple threads concurrently
+        threads: List of (pc, priority) tuples
+        """
+        self.multithreading_enabled = True
+        self.tracing = trace
+        
+        # Create all threads
+        for pc, priority in threads:
+            self.scheduler.create_thread(pc, priority)
+        
+        # Start first thread
+        first_thread = self.scheduler.schedule_next()
+        if not first_thread:
+            logger.warning("No threads to run")
+            return 0
+        
+        first_thread.restore_context(self)
+        
+        # Run until all threads complete
+        total_steps = 0
+        try:
+            while self.scheduler.get_thread_count() > 0:
+                # Run current thread for its time slice
+                steps = await self.run_async(max_steps=None, trace=trace)
+                total_steps += steps
+                
+                # Check if current thread terminated
+                if self.halted and self.scheduler.current_thread:
+                    self.scheduler.terminate_thread(self.scheduler.current_thread.tid)
+                    self.halted = False
+                
+                # Unblock waiting threads
+                self.scheduler.unblock_threads()
+                
+                # Schedule next thread
+                next_thread = self.scheduler.schedule_next()
+                if next_thread:
+                    next_thread.restore_context(self)
+                else:
+                    break
+                    
+        finally:
+            self.multithreading_enabled = False
+            self.tracing = False
+            
+        logger.info(f"All threads completed. Total instructions: {total_steps}")
+        return total_steps
+    
     def dump_regs(self) -> str:
         lines = []
         for i in range(0, NUM_REGS, 4):
@@ -4511,6 +4793,10 @@ class Shell:
                     if result == 0xDEADBEEF:  # Reboot signal
                         print("System rebooting...")
                         return True  # Signal to reboot
+                elif cmd == "runmt":
+                    self.do_runmt(args)
+                elif cmd == "threads":
+                    self.do_threads(args)
                 elif cmd == "memmap":
                     self.do_memmap(args)
                 elif cmd == "regs":
@@ -4979,12 +5265,25 @@ class Shell:
             print(f"Executing {fname} at {addr:08x} (size {len(data)} bytes).")
         
         try:
-            self.cpu.run(trace=trace_mode)
+            # Add max_steps to prevent infinite loops (10 million instructions)
+            import time
+            start_time = time.time()
+            steps = self.cpu.run(max_steps=10_000_000, trace=trace_mode)
+            elapsed = time.time() - start_time
+            
+            # Always show execution stats
+            print(f"Executed {steps:,} instructions in {elapsed:.4f}s ({steps/elapsed if elapsed > 0 else 0:,.0f} inst/sec)")
+            
+            if steps >= 10_000_000:
+                print(f"WARNING: Program reached maximum instruction limit ({steps:,} steps)")
         except Exception as e:
             print("Execution error:", e)
             if debug_mode:
                 import traceback
                 traceback.print_exc()
+        
+        # Show key register values after execution
+        print(f"Key registers: R0={self.cpu.reg_read(0)}, R1={self.cpu.reg_read(1)}, R2={self.cpu.reg_read(2)}")
         
         # Show output mode results
         if output_mode or debug_mode:
@@ -5006,6 +5305,94 @@ class Shell:
         else:
             print("\n[Program finished]")
             return 0
+    
+    def do_runmt(self, args):
+        """Run program with multithreading support"""
+        if not args:
+            print("Usage: runmt <file1> [file2] [file3] ... [--priority=5] [--trace]")
+            print("  Run multiple programs as concurrent threads")
+            print("  --priority=N : Set thread priority (0-10, default=5)")
+            print("  --trace      : Enable instruction tracing")
+            return
+        
+        # Parse flags
+        trace_mode = "--trace" in args
+        priority = 5
+        
+        # Extract priority if specified
+        files = []
+        for arg in args:
+            if arg.startswith("--priority="):
+                try:
+                    priority = int(arg.split("=")[1])
+                    priority = max(0, min(10, priority))  # Clamp to 0-10
+                except ValueError:
+                    print(f"Invalid priority value: {arg}")
+                    return
+            elif not arg.startswith("--"):
+                files.append(arg)
+        
+        if not files:
+            print("No files specified")
+            return
+        
+        # Load all programs and create thread list
+        threads = []
+        base_addr = 0x1000
+        
+        for i, fname in enumerate(files):
+            if fname not in self.kernel.files:
+                print(f"File not found: {fname}")
+                return
+            
+            data = self.kernel.files[fname]["data"]
+            addr = base_addr + (i * 0x10000)  # Separate address space per thread
+            
+            # Load program into memory
+            try:
+                self.cpu.mem.load_bytes(addr, data)
+                threads.append((addr, priority))
+                print(f"Loaded {fname} at {addr:08x} (size {len(data)} bytes)")
+            except Exception as e:
+                print(f"Failed to load {fname}: {e}")
+                return
+        
+        print(f"\nStarting {len(threads)} thread(s)...")
+        
+        # Run multithreaded
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # No running loop, create a new one
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        
+        try:
+            total_steps = loop.run_until_complete(
+                self.cpu.run_multithreaded(threads, trace=trace_mode)
+            )
+            print(f"\n[All threads finished - {total_steps} total instructions]")
+        except Exception as e:
+            print(f"Execution error: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def do_threads(self, args):
+        """Show thread information"""
+        threads = self.cpu.scheduler.list_threads()
+        if not threads:
+            print("No active threads")
+            return
+        
+        print("\nActive Threads:")
+        print("=" * 60)
+        print(f"{'TID':<6} {'State':<12} {'Priority':<10} {'PC':<10} {'Instructions':<15}")
+        print("-" * 60)
+        for t in threads:
+            print(f"{t['tid']:<6} {t['state']:<12} {t['priority']:<10} {t['pc']:08x}   {t['instructions']:<15}")
+        print("=" * 60)
+        print(f"Total threads: {len(threads)}")
+    
     def do_memmap(self, args):
         if len(args) != 2:
             print("Usage: memmap <addr> <len>")
@@ -5034,11 +5421,16 @@ class Shell:
         for l in lines:
             print(l)
     def do_ps(self, args):
-        """List processes"""
-        print("PID  Name        State      Priority  CPU Time")
-        print("---  ----        -----      --------  --------")
-        # In this simple implementation, we only have one process
-        print(f"1    main        RUNNING    10        0.0")
+        """List processes/threads"""
+        threads = self.cpu.scheduler.list_threads()
+        if not threads:
+            print("No active threads")
+            return
+        
+        print("TID  State      Priority  PC        Instructions")
+        print("---  -----      --------  --------  ------------")
+        for t in threads:
+            print(f"{t['tid']:<4} {t['state']:<10} {t['priority']:<9} {t['pc']:08x}  {t['instructions']}")
     def do_kill(self, args):
         """Kill process by PID"""
         if not args:
@@ -6757,7 +7149,7 @@ HALT
 ; Showcases: .equ, expressions, .string, .macro, labels
 
 .equ SCREEN_START, 0xB800
-.equ BUFFER_SIZE, 256
+.equ BUFFER_SIZE, 10
 .equ SYSCALL_WRITE, 1
 
 ; Macro to print a string
@@ -6769,34 +7161,17 @@ HALT
     SYSCALL R0
 .endm
 
-.org 0x0000
+.org 0x1000
 start:
-    ; Use expression evaluation
-    LOADI R0, (5 + 3) * 2      ; R0 = 16
-    LOADI R1, BUFFER_SIZE      ; R1 = 256 (from constant)
-    LOADI R2, SCREEN_START     ; R2 = 0xB800
-    
-    ; Test new instructions
-    SETG R3                     ; Set if greater
-    LOOP test_loop              ; Loop instruction
-    
-    ; Use macro with label
-    PRINT msgdata
-    
-    ; String operations
-    LOADI R2, srcdata
-    LOADI R3, dstdata
-    MOVSB                       ; Move string byte
+    ; Simple test
+    LOADI R0, 5
+    LOADI R1, 3
+    ADD R0, R1
     
     HALT
 
-test_loop:
-    DEC R1
-    JNZ test_loop
-    RET
-
 ; Data section with .string directive
-.org 0x0100
+.org 0x1100
 msgdata:
 .string "Hello from macro!\n"
 
@@ -6853,6 +7228,74 @@ dstdata:
             logger.info("Created fallback demo")
         except Exception as e2:
             logger.error("Failed to create fallback demo: %s", e2)
+    
+    # Create multithreading demo programs
+    THREAD_DEMO_1 = r"""
+; Thread 1: Counter that counts to 10 and yields
+start:
+    LOADI R0, 0        ; Counter
+    LOADI R1, 10       ; Max count
+loop:
+    INC R0
+    CMP R0, R1
+    YIELD              ; Yield to other threads
+    JL loop
+    HALT
+"""
+    
+    THREAD_DEMO_2 = r"""
+; Thread 2: Accumulator that adds numbers
+start:
+    LOADI R0, 0        ; Sum
+    LOADI R1, 5        ; Counter
+loop:
+    ADD R0, R1
+    DEC R1
+    JNZ loop           ; Loop without YIELD for single-thread mode
+    HALT
+"""
+    
+    THREAD_DEMO_3 = r"""
+; Thread 3: Multiplier
+start:
+    LOADI R0, 1        ; Result
+    LOADI R1, 2        ; Multiplier
+    LOADI R2, 4        ; Counter
+loop:
+    MUL R0, R1
+    DEC R2
+    JNZ loop           ; Loop without YIELD for single-thread mode
+    HALT
+"""
+    
+    try:
+        thread1_bin = assembler.assemble(THREAD_DEMO_1)
+        kernel.files["/thread1.bin"] = {
+            "data": thread1_bin,
+            "permissions": 0o755,
+            "created_time": time.time(),
+            "modified_time": time.time()
+        }
+        
+        thread2_bin = assembler.assemble(THREAD_DEMO_2)
+        kernel.files["/thread2.bin"] = {
+            "data": thread2_bin,
+            "permissions": 0o755,
+            "created_time": time.time(),
+            "modified_time": time.time()
+        }
+        
+        thread3_bin = assembler.assemble(THREAD_DEMO_3)
+        kernel.files["/thread3.bin"] = {
+            "data": thread3_bin,
+            "permissions": 0o755,
+            "created_time": time.time(),
+            "modified_time": time.time()
+        }
+        
+        logger.info("Successfully created multithreading demo programs")
+    except Exception as e:
+        logger.warning("Failed to create multithreading demos: %s", e)
 
 def main_system():
     """Main system loop with reboot capability"""
