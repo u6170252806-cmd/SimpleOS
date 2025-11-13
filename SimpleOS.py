@@ -30,6 +30,8 @@ import os
 import random
 import socket
 import threading
+import re
+import ast
 from typing import Dict, List, Tuple, Optional, Callable, Any
 from enum import IntEnum
 import asyncio
@@ -101,6 +103,12 @@ FLAG_TRAP = 1 << 5
 # --- Additional Flags ---
 FLAG_AUX = 1 << 6  # Auxiliary Carry Flag (for BCD operations)
 FLAG_DIR = 1 << 7  # Direction Flag (for string operations)
+FLAG_PARITY = 1 << 23  # Parity Flag (even parity)
+FLAG_ADJUST = 1 << 24  # Adjust Flag (for decimal arithmetic)
+FLAG_RESUME = 1 << 25  # Resume Flag (for debugging)
+FLAG_POWER_SAVE = 1 << 26  # CPU running in power-save mode
+FLAG_THERMAL = 1 << 27     # Thermal throttling active
+FLAG_SECURE = 1 << 28      # Secure execution mode
 
 # x86-style flag aliases
 FLAG_CF = FLAG_CARRY       # Carry Flag
@@ -389,6 +397,11 @@ OP_GETTIME = 0x105
 OP_SLEEP = 0x106
 OP_YIELD = 0x107
 OP_BARRIER = 0x108
+OP_MEMSCRUB = 0x150
+OP_ADDI = 0x151
+OP_SUBI = 0x152
+OP_MULI = 0x153
+OP_DIVI = 0x154
 
 OPCODE_NAME = {
     OP_NOP: "NOP", OP_MOV: "MOV", OP_LOADI: "LOADI", OP_LOAD: "LOAD", OP_STORE: "STORE",
@@ -404,7 +417,8 @@ OPCODE_NAME = {
     OP_LEA: "LEA", OP_MOVZX: "MOVZX", OP_MOVSX: "MOVSX",
     OP_MOVB: "MOVB", OP_MOVW: "MOVW", OP_LOADB: "LOADB", OP_STOREB: "STOREB",
     OP_SEXT: "SEXT", OP_ZEXT: "ZEXT", OP_POPCNT: "POPCNT", OP_MIN: "MIN", OP_MAX: "MAX", OP_ABS: "ABS",
-    OP_MEMCPY: "MEMCPY", OP_MEMSET: "MEMSET", OP_STRLEN: "STRLEN", OP_STRCMP: "STRCMP", OP_CLAMP: "CLAMP",
+    OP_MEMCPY: "MEMCPY", OP_MEMSET: "MEMSET", OP_MEMSCRUB: "MEMSCRUB",
+    OP_STRLEN: "STRLEN", OP_STRCMP: "STRCMP", OP_CLAMP: "CLAMP",
     OP_ADC: "ADC", OP_SBB: "SBB", OP_CBW: "CBW", OP_CWD: "CWD", OP_CWDQ: "CWDQ",
     OP_CLC: "CLC", OP_STC: "STC", OP_CLI: "CLI", OP_STI: "STI", OP_LAHF: "LAHF", OP_SAHF: "SAHF",
     OP_PUSHF: "PUSHF", OP_POPF: "POPF", OP_LEAVE: "LEAVE", OP_ENTER: "ENTER", OP_NOP2: "NOP2",
@@ -435,6 +449,7 @@ OPCODE_NAME = {
     OP_SWAP: "SWAP", OP_ROT: "ROT", OP_REVERSE: "REVERSE", OP_GETSEED: "GETSEED", OP_SETSEED: "SETSEED",
     OP_RANDOM: "RANDOM", OP_HASH: "HASH", OP_CRC32: "CRC32", OP_GETTIME: "GETTIME", OP_SLEEP: "SLEEP",
     OP_YIELD: "YIELD", OP_BARRIER: "BARRIER",
+    OP_ADDI: "ADDI", OP_SUBI: "SUBI", OP_MULI: "MULI", OP_DIVI: "DIVI",
     OP_SETG: "SETG", OP_SETLE: "SETLE", OP_SETGE: "SETGE", OP_SETNE: "SETNE", OP_SETE: "SETE",
     OP_LOOP: "LOOP", OP_LOOPZ: "LOOPZ", OP_LOOPNZ: "LOOPNZ",
     OP_REP: "REP", OP_REPZ: "REPZ", OP_REPNZ: "REPNZ",
@@ -443,7 +458,7 @@ OPCODE_NAME = {
     OP_IMUL3: "IMUL3", OP_SHLD: "SHLD", OP_SHRD: "SHRD",
     OP_RDTSC: "RDTSC", OP_RDMSR: "RDMSR", OP_WRMSR: "WRMSR", OP_CPUID2: "CPUID2",
     OP_PAUSE: "PAUSE", OP_NOP3: "NOP3", OP_NOP4: "NOP4",
-    OP_LOCK: "LOCK", OP_REPNE: "REPNE", OP_REPE: "REPE",
+OP_LOCK: "LOCK", OP_REPNE: "REPNE", OP_REPE: "REPE",
 }
 
 NAME_OPCODE = {v: k for k, v in OPCODE_NAME.items()}
@@ -461,6 +476,8 @@ DATA_SIZE = 0x08000000   # 128MB data
 FLAG_NAME_MAP = {
     "ZERO": FLAG_ZERO, "NEG": FLAG_NEG, "CARRY": FLAG_CARRY, "OVERFLOW": FLAG_OVERFLOW,
     "INTERRUPT": FLAG_INTERRUPT, "TRAP": FLAG_TRAP, "AUX": FLAG_AUX, "DIR": FLAG_DIR,
+    "PARITY": FLAG_PARITY, "ADJUST": FLAG_ADJUST, "RESUME": FLAG_RESUME,
+    "POWER": FLAG_POWER_SAVE, "THERMAL": FLAG_THERMAL, "SECURE": FLAG_SECURE,
 }
 # Instruction packing helpers
 def pack_instruction(opcode: int, dst: int = 0, src: int = 0, imm16: int = 0) -> int:
@@ -822,6 +839,7 @@ class Memory:
             'total_writes': 0,
             'total_allocations': 0,
             'fragmentation': 0.0,
+            'scrub_operations': 0,
         }
         self.breakpoints = set()
         self.access_log = []
@@ -1184,6 +1202,7 @@ class Memory:
             'cache_ratio': self.cache_hits / (self.cache_hits + self.cache_misses) if (self.cache_hits + self.cache_misses) > 0 else 0,
             'protected_regions': len(self.protected_regions),
             'breakpoints': len(self.breakpoints),
+            'scrub_operations': self.memory_stats['scrub_operations'],
         }
     
     def clear_cache(self):
@@ -1205,8 +1224,17 @@ class Memory:
             f"  Cache Ratio: {stats['cache_ratio']:.2%}",
             f"  Protected Regions: {stats['protected_regions']}",
             f"  Breakpoints: {stats['breakpoints']}",
+            f"  Scrub Operations: {stats['scrub_operations']}",
         ]
         return "\n".join(lines)
+
+    def scrub(self, addr: int, length: int):
+        """Securely overwrite a region with zeros."""
+        if length <= 0:
+            return
+        for offset in range(length):
+            self.write_byte((addr + offset) & 0xFFFFFFFF, 0)
+        self.memory_stats['scrub_operations'] += 1
 
 # ---------------------------
 # Process Management
@@ -1336,24 +1364,253 @@ class Kernel:
         self.start_time = time.time()
         self.cwd = "/"  # Current working directory
         # seed some files
+        now = time.time()
+        self.files["/"] = {
+            "data": b"",  # Directory marker
+            "permissions": 0o755,
+            "created_time": now,
+            "modified_time": now,
+            "is_dir": True,
+        }
         self.files["/readme.txt"] = {
             "data": b"SimpleOS readme: use ls, cat, whoami, echo, write, loadasm, run\n",
             "permissions": 0o644,
-            "created_time": time.time(),
-            "modified_time": time.time()
+            "created_time": now,
+            "modified_time": now,
+            "is_dir": False,
         }
         self.files["/hello.bin"] = {
             "data": b"",  # maybe an assembled program can be stored here
             "permissions": 0o755,
-            "created_time": time.time(),
-            "modified_time": time.time()
+            "created_time": now,
+            "modified_time": now,
+            "is_dir": False,
         }
-        self.files["/"] = {
-            "data": b"",  # Directory marker
-            "permissions": 0o755,
-            "created_time": time.time(),
-            "modified_time": time.time()
+        # Ensure useful directories exist
+        self.ensure_directory("/home")
+        self.ensure_directory(self.env_vars["HOME"])
+
+    # --- Filesystem helpers -------------------------------------------------
+    def normalize_path(self, path: str, cwd: Optional[str] = None) -> str:
+        """Return canonical absolute path inside the virtual filesystem."""
+        if not path:
+            return self.cwd if self.cwd else "/"
+
+        if cwd is None:
+            cwd = self.cwd if self.cwd else "/"
+        if not cwd.startswith("/"):
+            cwd = "/" + cwd
+
+        if path.startswith("/"):
+            combined = path
+        else:
+            if cwd == "/":
+                combined = f"/{path}"
+            else:
+                combined = f"{cwd.rstrip('/')}/{path}"
+
+        parts: List[str] = []
+        for part in combined.split("/"):
+            if not part or part == ".":
+                continue
+            if part == "..":
+                if parts:
+                    parts.pop()
+                continue
+            parts.append(part)
+        normalized = "/" + "/".join(parts)
+        return normalized if parts else "/"
+
+    def ensure_directory(self, path: str):
+        """Ensure that a directory (and its parents) exists."""
+        path = self.normalize_path(path)
+        if path == "/":
+            self.files.setdefault("/", {
+                "data": b"",
+                "permissions": 0o755,
+                "created_time": time.time(),
+                "modified_time": time.time(),
+                "is_dir": True,
+            })
+            return
+
+        parts = path.strip("/").split("/")
+        current = ""
+        for idx in range(len(parts)):
+            current = "/" + "/".join(parts[:idx + 1])
+            entry = self.files.get(current)
+            if entry is None:
+                now = time.time()
+                self.files[current] = {
+                    "data": b"",
+                    "permissions": 0o755,
+                    "created_time": now,
+                    "modified_time": now,
+                    "is_dir": True,
+                }
+            else:
+                entry["is_dir"] = True
+
+    def ensure_parent_directory(self, path: str):
+        """Ensure that the parent directory of a path exists."""
+        path = self.normalize_path(path)
+        if path == "/":
+            return
+        parent = "/" + "/".join(path.strip("/").split("/")[:-1])
+        if parent == "":
+            parent = "/"
+        self.ensure_directory(parent)
+
+    def list_directory(self, path: str, cwd: Optional[str] = None) -> List[Tuple[str, Dict[str, Any]]]:
+        """List direct children for a directory or return the file entry."""
+        path = self.normalize_path(path, cwd)
+        entry = self.files.get(path)
+        if entry is None:
+            raise FileNotFoundError(path)
+        if not entry.get("is_dir", False):
+            return [(path, entry)]
+
+        children: Dict[str, Tuple[str, Dict[str, Any]]] = {}
+        prefix = "" if path == "/" else f"{path.rstrip('/')}/"
+        for full_path, meta in self.files.items():
+            normalized = self.normalize_path(full_path, "/")
+            if normalized == path:
+                continue
+            if path == "/":
+                if not normalized.startswith("/") or normalized.count("/") == 0:
+                    continue
+                rel = normalized.lstrip("/")
+            else:
+                if not normalized.startswith(prefix):
+                    continue
+                rel = normalized[len(prefix):]
+            if not rel:
+                continue
+            parts = rel.split("/")
+            child_name = parts[0]
+            child_path = "/" + child_name if path == "/" else f"{path.rstrip('/')}/{child_name}"
+            if child_name in children:
+                continue
+            if len(parts) > 1 and child_path not in self.files:
+                self.ensure_directory(child_path)
+            meta_entry = self.files.get(child_path, meta)
+            children[child_name] = (child_path, meta_entry)
+        return [children[name] for name in sorted(children)]
+
+    def remove_path(self, path: str) -> bool:
+        """Remove a file or directory recursively."""
+        path = self.normalize_path(path)
+        if path == "/":
+            return False
+        if path not in self.files:
+            return False
+        targets = [p for p in self.files.keys() if p == path or p.startswith(path.rstrip("/") + "/")]
+        for target in targets:
+            del self.files[target]
+        return True
+
+    def duplicate_path(self, src: str, dest: str, move: bool = False) -> bool:
+        """Copy or move a file/directory tree."""
+        src = self.normalize_path(src)
+        dest = self.normalize_path(dest)
+        if src not in self.files or src == "/":
+            return False
+        if dest == src or dest.startswith(src.rstrip("/") + "/"):
+            return False
+        src_meta = self.files[src]
+        if src_meta.get("is_dir", False):
+            self.ensure_directory(dest)
+            suffix_map = sorted([p for p in self.files.keys() if p == src or p.startswith(src.rstrip("/") + "/")])
+            new_entries = {}
+            for old_path in suffix_map:
+                suffix = old_path[len(src):]
+                if dest == "/":
+                    new_path = "/" + suffix.lstrip("/")
+                else:
+                    new_path = dest + suffix
+                new_path = self.normalize_path(new_path, "/")
+                meta = self.files[old_path]
+                payload = b""
+                if not meta.get("is_dir", False):
+                    raw = meta["data"]
+                    payload = raw.encode("utf-8") if isinstance(raw, str) else bytes(raw)
+                new_entries[new_path] = {
+                    "data": payload,
+                    "permissions": meta["permissions"],
+                    "created_time": time.time(),
+                    "modified_time": time.time(),
+                    "is_dir": meta.get("is_dir", False),
+                }
+            self.files.update(new_entries)
+        else:
+            self.ensure_parent_directory(dest)
+            raw = src_meta["data"]
+            payload = raw.encode("utf-8") if isinstance(raw, str) else bytes(raw)
+            self.files[dest] = {
+                "data": payload,
+                "permissions": src_meta["permissions"],
+                "created_time": time.time(),
+                "modified_time": time.time(),
+                "is_dir": False,
+            }
+        if move:
+            self.remove_path(src)
+        return True
+
+    @staticmethod
+    def display_name(path: str) -> str:
+        """Return basename for display."""
+        if path == "/":
+            return "/"
+        if not path:
+            return ""
+        return path.rstrip("/").split("/")[-1]
+
+    def get_entry(self, path: str, cwd: Optional[str] = None) -> Tuple[str, Dict[str, Any]]:
+        """Get file metadata for path."""
+        abs_path = self.normalize_path(path, cwd)
+        entry = self.files.get(abs_path)
+        if entry is None:
+            raise FileNotFoundError(abs_path)
+        return abs_path, entry
+
+    def read_file(self, path: str, cwd: Optional[str] = None) -> Tuple[str, bytes]:
+        """Read file data, ensuring it is not a directory."""
+        abs_path, entry = self.get_entry(path, cwd)
+        if entry.get("is_dir", False):
+            raise IsADirectoryError(abs_path)
+        data = entry["data"]
+        if isinstance(data, str):
+            data = data.encode("utf-8")
+        return abs_path, data
+
+    def write_file(self, path: str, data: bytes, permissions: int = 0o644,
+                   cwd: Optional[str] = None):
+        """Write file data, creating parents as needed."""
+        if isinstance(data, str):
+            data = data.encode("utf-8")
+        abs_path = self.normalize_path(path, cwd)
+        self.ensure_parent_directory(abs_path)
+        now = time.time()
+        created = self.files.get(abs_path, {}).get("created_time", now)
+        self.files[abs_path] = {
+            "data": data,
+            "permissions": permissions,
+            "created_time": created,
+            "modified_time": now,
+            "is_dir": False,
         }
+        return abs_path
+
+    def touch_file(self, path: str, cwd: Optional[str] = None):
+        """Create file if missing or update timestamp."""
+        abs_path = self.normalize_path(path, cwd)
+        now = time.time()
+        entry = self.files.get(abs_path)
+        if entry is None:
+            self.write_file(abs_path, b"", cwd="/")
+        else:
+            entry["modified_time"] = now
     def syscall(self, cpu: "CPU"):
         num = cpu.reg_read(0)
         a1 = cpu.reg_read(1)
@@ -1395,13 +1652,19 @@ class Kernel:
             else:
                 cpu.reg_write(0, 0)
         elif num == 3:  # LIST_DIR(dir_addr, out_addr)
-            # ignore dir_arg and just list root
+            dir_addr = a1
             out_addr = a2
-            # Format: null-separated filenames, terminated by double null
-            names = "\0".join(self.files.keys()) + "\0\0"
+            dir_path = self.read_cstring(cpu.mem, dir_addr) if dir_addr else "/"
+            dir_path = dir_path or "/"
+            try:
+                entries = self.list_directory(dir_path, "/")
+            except (FileNotFoundError, NotADirectoryError):
+                cpu.reg_write(0, 0)
+                return
+            names = "\0".join(self.display_name(path) for path, _ in entries) + "\0\0"
             data = names.encode("utf-8")
             cpu.mem.load_bytes(out_addr, data)
-            cpu.reg_write(0, len(self.files))
+            cpu.reg_write(0, len(entries))
         elif num == 4:  # WHOAMI(out_addr)
             out_addr = a1
             data = (self.username + "\0").encode("utf-8")
@@ -1420,24 +1683,20 @@ class Kernel:
             dest = a2
             # Read filename (null-terminated)
             fname = self.read_cstring(cpu.mem, faddr)
-            if fname in self.files:
-                data = self.files[fname]["data"]
-                cpu.mem.load_bytes(dest, data)
-                cpu.reg_write(0, len(data))
-            else:
+            try:
+                _, data = self.read_file(fname, "/")
+            except (FileNotFoundError, IsADirectoryError):
                 cpu.reg_write(0, 0)
+                return
+            cpu.mem.load_bytes(dest, data)
+            cpu.reg_write(0, len(data))
         elif num == 7:  # STORE_FILE(filename_addr, src_addr, len)
             fname = self.read_cstring(cpu.mem, a1)
             src = a2
             length = a3
             try:
                 data = cpu.mem.dump(src, length)
-                self.files[fname] = {
-                    "data": data,
-                    "permissions": 0o644,
-                    "created_time": time.time(),
-                    "modified_time": time.time()
-                }
+                self.write_file(fname, data, 0o644, "/")
                 cpu.reg_write(0, len(data))
             except Exception:
                 cpu.reg_write(0, 0)
@@ -1493,6 +1752,7 @@ class Kernel:
         elif num == 17:  # CHMOD
             fname = self.read_cstring(cpu.mem, a1)
             mode = a2
+            fname = self.normalize_path(fname, "/")
             if fname in self.files:
                 self.files[fname]["permissions"] = mode
                 cpu.reg_write(0, 1)
@@ -1500,42 +1760,35 @@ class Kernel:
                 cpu.reg_write(0, 0)
         elif num == 18:  # MKDIR
             dirname = self.read_cstring(cpu.mem, a1)
-            if dirname not in self.files:
-                self.files[dirname] = {
-                    "data": b"",
-                    "permissions": 0o755,
-                    "created_time": time.time(),
-                    "modified_time": time.time()
-                }
-                cpu.reg_write(0, 1)
-            else:
+            dirname = self.normalize_path(dirname, "/")
+            if dirname in self.files and not self.files[dirname].get("is_dir", False):
                 cpu.reg_write(0, 0)
+            else:
+                self.ensure_directory(dirname)
+                cpu.reg_write(0, 1)
         elif num == 19:  # REMOVE
             fname = self.read_cstring(cpu.mem, a1)
-            if fname in self.files:
-                del self.files[fname]
+            if self.remove_path(fname):
                 cpu.reg_write(0, 1)
             else:
                 cpu.reg_write(0, 0)
         elif num == 20:  # COPY
             src_name = self.read_cstring(cpu.mem, a1)
             dest_name = self.read_cstring(cpu.mem, a2)
-            if src_name in self.files:
-                self.files[dest_name] = self.files[src_name].copy()
+            if self.duplicate_path(src_name, dest_name, move=False):
                 cpu.reg_write(0, 1)
             else:
                 cpu.reg_write(0, 0)
         elif num == 21:  # MOVE
             src_name = self.read_cstring(cpu.mem, a1)
             dest_name = self.read_cstring(cpu.mem, a2)
-            if src_name in self.files:
-                self.files[dest_name] = self.files[src_name]
-                del self.files[src_name]
+            if self.duplicate_path(src_name, dest_name, move=True):
                 cpu.reg_write(0, 1)
             else:
                 cpu.reg_write(0, 0)
         elif num == 22:  # STAT
             fname = self.read_cstring(cpu.mem, a1)
+            fname = self.normalize_path(fname, "/")
             stat_buf_addr = a2
             if fname in self.files:
                 file_info = self.files[fname]
@@ -1556,14 +1809,14 @@ class Kernel:
                 cpu.reg_write(0, 0)
         elif num == 23:  # EXEC
             fname = self.read_cstring(cpu.mem, a1)
-            if fname in self.files:
-                # Load program into memory at address 0x1000
-                data = self.files[fname]["data"]
-                cpu.mem.load_bytes(0x1000, data)
-                cpu.pc = 0x1000
-                cpu.reg_write(0, 1)
-            else:
+            try:
+                _, data = self.read_file(fname, "/")
+            except (FileNotFoundError, IsADirectoryError):
                 cpu.reg_write(0, 0)
+                return
+            cpu.mem.load_bytes(0x1000, data)
+            cpu.pc = 0x1000
+            cpu.reg_write(0, 1)
         elif num == 24:  # REBOOT
             # Signal reboot to shell
             cpu.halted = True
@@ -1682,14 +1935,15 @@ class Kernel:
         elif num == 40:  # TYPE
             file_addr = a1
             fname = self.read_cstring(cpu.mem, file_addr)
-            if fname in self.files:
-                data = self.files[fname]["data"]
-                try:
-                    cpu.mem.load_bytes(a2, data) # Load data into buffer at a2
-                    cpu.reg_write(0, len(data))
-                except Exception:
-                    cpu.reg_write(0, 0)
-            else:
+            try:
+                _, data = self.read_file(fname, "/")
+            except (FileNotFoundError, IsADirectoryError):
+                cpu.reg_write(0, 0)
+                return
+            try:
+                cpu.mem.load_bytes(a2, data)  # Load data into buffer at a2
+                cpu.reg_write(0, len(data))
+            except Exception:
                 cpu.reg_write(0, 0)
         elif num == 41:  # CURL
             url_addr = a1
@@ -1711,26 +1965,32 @@ class Kernel:
             file_addr = a2
             pattern = self.read_cstring(cpu.mem, pattern_addr)
             fname = self.read_cstring(cpu.mem, file_addr)
-            # Simulated grep result
-            grep_result = "SimpleOS readme: use ls, cat, whoami, echo, write, loadasm, run\n"
-            data = grep_result.encode("utf-8") + b"\0"
-            cpu.mem.load_bytes(a3, data) # Output to third argument address
-            cpu.reg_write(0, len(data))
+            try:
+                _, data = self.read_file(fname, "/")
+            except (FileNotFoundError, IsADirectoryError):
+                cpu.reg_write(0, 0)
+                return
+            text = data.decode("utf-8", errors="replace")
+            matches = [line for line in text.splitlines() if pattern in line]
+            result = ("\n".join(matches) + ("\n" if matches else "")).encode("utf-8") + b"\0"
+            cpu.mem.load_bytes(a3, result)
+            cpu.reg_write(0, len(result))
         elif num == 44:  # WC
             file_addr = a1
             fname = self.read_cstring(cpu.mem, file_addr)
-            if fname in self.files:
-                data = self.files[fname]["data"]
-                # Count lines, words, chars
-                lines = data.count(b'\n')
-                words = len(data.split())
-                chars = len(data)
-                # Pack result into memory (e.g., 4 bytes for lines, 4 for words, 4 for chars)
-                # For simplicity, we'll just return lines
-                result = lines
-                cpu.reg_write(0, result)
-            else:
+            try:
+                _, data = self.read_file(fname, "/")
+            except (FileNotFoundError, IsADirectoryError):
                 cpu.reg_write(0, 0)
+                return
+            text = data.decode("utf-8", errors="replace")
+            lines = text.count("\n")
+            words = len(text.split())
+            chars = len(text)
+            # Pack counts into registers (lines in R0, words in R1, chars in R2)
+            cpu.reg_write(0, lines & 0xFFFFFFFF)
+            cpu.reg_write(1, words & 0xFFFFFFFF)
+            cpu.reg_write(2, chars & 0xFFFFFFFF)
         else:
             logger.warning("Unknown syscall %d", num)
             cpu.reg_write(0, 0)
@@ -3315,6 +3575,43 @@ class CPU:
             length = self.reg_read(2) & 0xFFFFFFFF
             for i in range(length):
                 self.mem.write_byte((dst_addr + i) & 0xFFFFFFFF, value)
+        elif opcode == OP_MEMSCRUB:
+            # Secure memory scrub: R0=start_addr, R1=length
+            start_addr = self.reg_read(0) & 0xFFFFFFFF
+            length = self.reg_read(1) & 0xFFFFFFFF
+            try:
+                self.mem.scrub(start_addr, length)
+                self.reg_write(dst, length & 0xFFFFFFFF)
+            except MemoryError:
+                self.reg_write(dst, 0)
+        elif opcode == OP_ADDI:
+            imm_val = to_signed16(imm16)
+            orig = self.reg_read(dst)
+            res = (orig + imm_val) & 0xFFFFFFFF
+            self.reg_write(dst, res)
+            self.update_arithmetic_flags(orig, imm_val, res)
+        elif opcode == OP_SUBI:
+            imm_val = to_signed16(imm16)
+            orig = self.reg_read(dst)
+            res = (orig - imm_val) & 0xFFFFFFFF
+            self.reg_write(dst, res)
+            self.update_arithmetic_flags(orig, imm_val, res)
+        elif opcode == OP_MULI:
+            imm_val = to_signed16(imm16)
+            orig = self.reg_read(dst)
+            res = (orig * imm_val) & 0xFFFFFFFF
+            self.reg_write(dst, res)
+            self.update_arithmetic_flags(orig, imm_val, res)
+        elif opcode == OP_DIVI:
+            imm_val = to_signed16(imm16)
+            orig = self.reg_read(dst)
+            if imm_val == 0:
+                self.set_flag(FLAG_OVERFLOW)
+                self.reg_write(dst, 0)
+            else:
+                res = int(orig / imm_val) & 0xFFFFFFFF
+                self.reg_write(dst, res)
+                self.update_arithmetic_flags(orig, imm_val, res)
         elif opcode == OP_STRLEN:
             # String length: R0=string_addr, result in dst
             addr = self.reg_read(0) & 0xFFFFFFFF
@@ -4464,6 +4761,13 @@ class Assembler:
                     imm = self.resolve_label_token(imm)
                     imm_val = self.parse_imm(imm)
                     word = pack_instruction(opcode, dst, 0, imm_val & 0xFFFF)
+                elif opcode in (OP_ADDI, OP_SUBI, OP_MULI, OP_DIVI):
+                    if len(args) != 2:
+                        raise AssemblerError(f"{mnem} requires register and immediate")
+                    dst = self.parse_reg(args[0])
+                    imm = self.resolve_label_token(args[1])
+                    imm_val = self.parse_imm(imm)
+                    word = pack_instruction(opcode, dst, 0, imm_val & 0xFFFF)
                 elif opcode in (OP_LOAD, OP_STORE) and len(args) == 2:
                     # Support forms:
                     #   LOAD Rdst, Rsrc        ; indirect load from address in Rsrc
@@ -4570,6 +4874,348 @@ class Assembler:
         return result
 
 # ---------------------------
+# Simple C++ Compiler (cas++)
+# ---------------------------
+class CppCompilerError(Exception):
+    """Raised when the C++ compiler encounters an error."""
+
+
+class CppCompiler:
+    """
+    Extremely small C++ compiler that supports a subset of the language:
+    - int main() { ... }
+    - printf("text");
+    - return <constant>;
+    The compiler translates supported statements to SimpleOS assembly and
+    uses the existing assembler to generate binaries.
+    """
+    def __init__(self, assembler_factory: Callable[[], Assembler] = None):
+        self.assembler_factory = assembler_factory or Assembler
+        self.reset()
+
+    def reset(self):
+        self.string_literals: List[Tuple[str, str]] = []
+        self._string_map: Dict[str, str] = {}
+        self.functions: Dict[str, Dict[str, Any]] = {}
+        self.warnings: List[str] = []
+        self.last_assembly: str = ""
+        self.variables: Dict[str, int] = {}
+        self.includes: List[str] = []
+
+    PROGRAM_BASE = 0x1000
+
+    def compile(self, code: str) -> bytes:
+        self.reset()
+        cleaned = self._strip_comments(code)
+        cleaned = self._remove_includes(cleaned)
+        body = self._extract_main_body(cleaned)
+        statements = self._split_statements(body)
+        assembly_lines = [
+            "; Generated by cas++ compiler",
+            f".org 0x{self.PROGRAM_BASE:04x}",
+            "main:"
+        ]
+        has_return = False
+        for stmt in statements:
+            stmt = stmt.strip()
+            if not stmt:
+                continue
+            translated, returns = self._translate_statement(stmt)
+            assembly_lines.extend(translated)
+            if returns:
+                has_return = True
+        if not has_return:
+            assembly_lines.append("    LOADI R0, 0")
+        assembly_lines.append("    HALT")
+        if self.string_literals:
+            assembly_lines.append("")
+            assembly_lines.append("; --- cas++ string literals ---")
+            for label, text in self.string_literals:
+                assembly_lines.append(f"{label}:")
+                assembly_lines.append(f"    .string {self._escape_string(text)}")
+        self.last_assembly = "\n".join(assembly_lines)
+        assembler = self.assembler_factory()
+        try:
+            binary = assembler.assemble(self.last_assembly)
+        except AssemblerError as exc:
+            raise CppCompilerError(str(exc)) from exc
+        self.functions["main"] = {"statements": len(statements)}
+        return binary
+
+    def get_assembly_output(self) -> str:
+        return self.last_assembly
+
+    def _remove_includes(self, code: str) -> str:
+        lines = []
+        for raw in code.splitlines():
+            stripped = raw.strip()
+            if stripped.startswith("#include"):
+                parts = stripped.split()
+                if len(parts) > 1:
+                    self.includes.append(parts[1])
+                continue
+            lines.append(raw)
+        return "\n".join(lines)
+
+    def _strip_comments(self, code: str) -> str:
+        pattern = re.compile(r'//.*?$|/\*.*?\*/', re.DOTALL | re.MULTILINE)
+        return re.sub(pattern, '', code)
+
+    def _extract_main_body(self, code: str) -> str:
+        match = re.search(r'int\s+main\s*\([^)]*\)\s*{', code)
+        if not match:
+            raise CppCompilerError("cas++ requires an int main() entry point")
+        start = match.end()
+        depth = 1
+        i = start
+        in_string = False
+        escape = False
+        while i < len(code):
+            ch = code[i]
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == '\\':
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+                i += 1
+                continue
+            if ch == '"':
+                in_string = True
+            elif ch == '{':
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0:
+                    return code[start:i]
+            i += 1
+        raise CppCompilerError("Unterminated main() body")
+
+    def _split_statements(self, body: str) -> List[str]:
+        statements: List[str] = []
+        current: List[str] = []
+        in_string = False
+        escape = False
+        for ch in body:
+            if in_string:
+                current.append(ch)
+                if escape:
+                    escape = False
+                elif ch == '\\':
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+                continue
+            if ch == '"':
+                in_string = True
+                current.append(ch)
+                continue
+            if ch == ';':
+                statements.append("".join(current))
+                current = []
+            elif ch in "{}":
+                continue
+            else:
+                current.append(ch)
+        if current:
+            statements.append("".join(current))
+        return statements
+
+    def _translate_statement(self, stmt: str) -> Tuple[List[str], bool]:
+        stmt = stmt.strip()
+        if not stmt:
+            return [], False
+        if stmt.startswith("printf"):
+            return self._translate_printf(stmt), False
+        if stmt.startswith("return"):
+            return self._translate_return(stmt), True
+        if stmt.startswith("int ") or stmt.startswith("const int"):
+            self._handle_declaration(stmt)
+            return [], False
+        if "=" in stmt and stmt.split("=")[0].strip().isidentifier():
+            self._handle_assignment(stmt)
+            return [], False
+        self.warnings.append(f"Unsupported statement ignored: {stmt}")
+        return [], False
+
+    def _translate_printf(self, stmt: str) -> List[str]:
+        match = re.match(r'printf\s*\(\s*(.+)\s*\)\s*$', stmt)
+        if not match:
+            raise CppCompilerError(f"Unable to parse printf statement: {stmt}")
+        argument = match.group(1).strip()
+        literal_token, remainder = self._split_string_literal(argument)
+        try:
+            text_value = ast.literal_eval(literal_token)
+        except Exception as exc:
+            raise CppCompilerError(f"Invalid string literal in printf: {exc}") from exc
+        remainder = remainder.strip()
+        if remainder:
+            if not remainder.startswith(","):
+                raise CppCompilerError("printf arguments must be separated by commas")
+            extra_args = self._split_arguments(remainder[1:].strip())
+            values = [self._evaluate_expression(arg) for arg in extra_args if arg]
+            for value in values:
+                if "%d" in text_value:
+                    text_value = text_value.replace("%d", str(value), 1)
+                else:
+                    text_value = f"{text_value}{value}"
+        label = self._add_string_literal(text_value)
+        length = len(text_value.encode('utf-8'))
+        return [
+            "    ; printf",
+            "    LOADI R0, 1",
+            "    LOADI R1, 1",
+            f"    LOADI R2, {label}",
+            f"    LOADI R3, {length}",
+            "    SYSCALL R0"
+        ]
+
+    def _translate_return(self, stmt: str) -> List[str]:
+        expr = stmt[len("return"):].strip()
+        if expr.endswith(";"):
+            expr = expr[:-1].strip()
+        if not expr:
+            imm = 0
+        else:
+            imm = self._evaluate_expression(expr)
+        return [
+            "    ; return statement",
+            f"    LOADI R0, {imm & 0xFFFFFFFF}"
+        ]
+
+    def _add_string_literal(self, literal: str) -> str:
+        if literal in self._string_map:
+            return self._string_map[literal]
+        label = f"__str_{len(self.string_literals)}"
+        self.string_literals.append((label, literal))
+        self._string_map[literal] = label
+        return label
+
+    def _escape_string(self, text_value: str) -> str:
+        escaped = text_value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\t", "\\t")
+        return f"\"{escaped}\""
+    
+    def _split_string_literal(self, argument: str) -> Tuple[str, str]:
+        if not argument.startswith('"'):
+            raise CppCompilerError("printf requires a string literal as the first argument")
+        escape = False
+        for idx in range(1, len(argument)):
+            ch = argument[idx]
+            if escape:
+                escape = False
+                continue
+            if ch == '\\':
+                escape = True
+                continue
+            if ch == '"':
+                return argument[:idx + 1], argument[idx + 1:]
+        raise CppCompilerError("Unterminated string literal in printf")
+
+    def _split_arguments(self, arg_string: str) -> List[str]:
+        args = []
+        current = []
+        depth = 0
+        in_string = False
+        escape = False
+        for ch in arg_string:
+            if in_string:
+                current.append(ch)
+                if escape:
+                    escape = False
+                elif ch == '\\':
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+                continue
+            if ch == '"':
+                in_string = True
+                current.append(ch)
+                continue
+            if ch == '(':
+                depth += 1
+            elif ch == ')':
+                if depth > 0:
+                    depth -= 1
+            if ch == ',' and depth == 0:
+                args.append("".join(current).strip())
+                current = []
+            else:
+                current.append(ch)
+        if current:
+            trailing = "".join(current).strip()
+            if trailing:
+                args.append(trailing)
+        return args
+
+    def _handle_declaration(self, stmt: str):
+        stmt = stmt.rstrip(";")
+        match = re.match(r'(const\s+)?int\s+([A-Za-z_]\w*)(\s*=\s*(.+))?$', stmt)
+        if not match:
+            raise CppCompilerError(f"Invalid declaration: {stmt}")
+        is_const = bool(match.group(1))
+        name = match.group(2)
+        init_expr = match.group(4)
+        if init_expr is not None:
+            value = self._evaluate_expression(init_expr.strip())
+        else:
+            value = 0
+        if name in self.variables:
+            self.warnings.append(f"Redeclaring variable {name}")
+        self.variables[name] = value
+        if is_const and init_expr is None:
+            raise CppCompilerError(f"const int {name} requires initialization")
+
+    def _handle_assignment(self, stmt: str):
+        stmt = stmt.rstrip(";")
+        parts = stmt.split("=", 1)
+        if len(parts) != 2:
+            raise CppCompilerError(f"Invalid assignment: {stmt}")
+        name = parts[0].strip()
+        expr = parts[1].strip()
+        if name not in self.variables:
+            raise CppCompilerError(f"Assignment to undeclared variable '{name}'")
+        self.variables[name] = self._evaluate_expression(expr)
+
+    def _evaluate_expression(self, expr: str) -> int:
+        try:
+            tree = ast.parse(expr, mode="eval")
+        except SyntaxError as exc:
+            raise CppCompilerError(f"Invalid expression '{expr}'") from exc
+        return self._eval_node(tree.body)
+
+    def _eval_node(self, node) -> int:
+        if isinstance(node, ast.Constant):
+            if isinstance(node.value, (int, float, bool)):
+                return int(node.value)
+            raise CppCompilerError("Only numeric constants supported")
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+            val = self._eval_node(node.operand)
+            return val if isinstance(node.op, ast.UAdd) else -val
+        if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Sub, ast.Mult, ast.FloorDiv, ast.Div, ast.Mod)):
+            left = self._eval_node(node.left)
+            right = self._eval_node(node.right)
+            if isinstance(node.op, ast.Add):
+                return left + right
+            if isinstance(node.op, ast.Sub):
+                return left - right
+            if isinstance(node.op, ast.Mult):
+                return left * right
+            if isinstance(node.op, (ast.Div, ast.FloorDiv)):
+                if right == 0:
+                    raise CppCompilerError("Division by zero in expression")
+                return left // right
+            if isinstance(node.op, ast.Mod):
+                if right == 0:
+                    raise CppCompilerError("Modulo by zero in expression")
+                return left % right
+        if isinstance(node, ast.Name):
+            if node.id not in self.variables:
+                raise CppCompilerError(f"Unknown identifier '{node.id}'")
+            return self.variables[node.id]
+        raise CppCompilerError("Unsupported expression construct")
+
+# ---------------------------
 # Host-side shell (interacts with kernel)
 # ---------------------------
 class Shell:
@@ -4582,6 +5228,10 @@ class Shell:
     echo <text...> - print text
     write <file> <text...> - write text to file
     loadasm <srcfile> <destfile> - assemble source file and store as binary
+    cas++ <src.cpp> [out.bin] [--run] [--asm] [--debug] - compile C++ source
+    compilecpp <src.cpp> [out.bin] [options] - alias for cas++
+    cpprun <src.cpp> [options] - compile and immediately run program
+    c++ - show cas++ compiler help and usage
     run <file> [addr] - load and execute binary file
     memmap <addr> <len> - map memory region
     regs - dump CPU registers
@@ -4628,6 +5278,7 @@ class Shell:
     wget <url> - simulate wget command
     grep <pattern> <file> - search within file
     wc <file> - count lines, words, characters in a file
+    memscrub <addr> <len> - securely zero a memory range
     """
     def __init__(self, kernel: Kernel, cpu: CPU, assembler: Assembler, bios: BIOS):
         self.kernel = kernel
@@ -4636,6 +5287,50 @@ class Shell:
         self.bios = bios
         self.bootloader = Bootloader()
         self.history_index = 0
+    
+    def _resolve_path(self, path: str) -> str:
+        """Resolve user-supplied path against current working directory."""
+        return self.kernel.normalize_path(path, self.kernel.cwd)
+    
+    def _default_cpp_output(self, filename: str) -> str:
+        if filename.endswith(".cpp"):
+            base = filename[:-4]
+        else:
+            base = filename
+        if not base:
+            base = "a"
+        return f"{base}.bin"
+    
+    def _get_file_entry(self, path: str, allow_dirs: bool = False):
+        """Retrieve a file entry with helpful error handling."""
+        try:
+            abs_path, entry = self.kernel.get_entry(path, self.kernel.cwd)
+        except FileNotFoundError:
+            print(f"File not found: {path}")
+            return None, None
+        if not allow_dirs and entry.get("is_dir", False):
+            print(f"{path} is a directory")
+            return None, None
+        return abs_path, entry
+    
+    def _read_file_bytes(self, path: str):
+        """Return (abs_path, bytes) for a file or (None, None) if missing."""
+        abs_path, entry = self._get_file_entry(path)
+        if abs_path is None:
+            return None, None
+        data = entry["data"]
+        if isinstance(data, str):
+            data = data.encode("utf-8")
+        return abs_path, data
+    
+    def _read_text(self, path: str):
+        """Return (abs_path, text) decoding as UTF-8."""
+        abs_path, entry = self._get_file_entry(path)
+        if abs_path is None:
+            return None, None
+        data = entry["data"]
+        text = data.decode("utf-8", errors="replace") if isinstance(data, bytes) else data
+        return abs_path, text
     def run(self):
         print("Welcome to SimpleOS shell. Type 'help' for commands.")
         while True:
@@ -4665,6 +5360,7 @@ class Shell:
                         print("  data      - Data encoding and hashing commands")
                         print("  memory    - Memory and CPU operations")
                         print("  network   - Network simulation commands")
+                        print("  cpp       - C++ compiler commands")
                         print("  util      - Utility commands")
                         print("\nUse 'help <category>' to see specific commands.")
                         # continue main loop (don't exit shell)
@@ -4734,6 +5430,7 @@ class Shell:
                         print("Memory & Assembly Commands:")
                         print("  memmap    - Map memory region")
                         print("  memstats  - Show memory statistics")
+                        print("  memscrub  - Securely zero a memory range")
                         print("  meminfo   - Show memory info")
                         print("  regs      - Show CPU registers")
                         print("  disasm    - Disassemble memory")
@@ -4744,6 +5441,12 @@ class Shell:
                         print("  asmtest   - Run assembler tests")
                         print("  run       - Execute program")
                         print("  cpuinfo   - Show CPU information")
+                    elif category == "cpp":
+                        print("C++ Compiler Commands:")
+                        print("  cas++      - Compile C++ source with cas++")
+                        print("  compilecpp - Alias for cas++")
+                        print("  cpprun     - Compile and immediately run C++ code")
+                        print("  c++        - Show detailed cas++ help")
                         print("  benchmark - Run benchmarks")
                     elif category == "network":
                         print("Network Commands:")
@@ -4780,6 +5483,14 @@ class Shell:
                     self.do_cat(args)
                 elif cmd == "nano":
                     self.do_nano(args)
+                elif cmd == "cas++":
+                    self.do_caspp(args)
+                elif cmd == "c++":
+                    self.do_cpp_help(args)
+                elif cmd == "compilecpp":
+                    self.do_compile_cpp(args)
+                elif cmd == "cpprun":
+                    self.do_run_cpp(args)
                 elif cmd == "whoami":
                     print(self.kernel.username)
                 elif cmd == "echo":
@@ -4920,6 +5631,8 @@ class Shell:
                     self.do_download(args)
                 elif cmd == "memstats":
                     self.do_memstats(args)
+                elif cmd == "memscrub":
+                    self.do_memscrub(args)
                 elif cmd == "meminfo":
                     self.do_meminfo(args)
                 elif cmd == "asmtest":
@@ -4985,62 +5698,49 @@ class Shell:
                 print("Error:", e)
         return False
     def do_ls(self, args):
+        """List files and directories"""
         long_format = False
-        path = self.kernel.cwd  # Use current working directory
-        if args:
-            if args[0] == "-l":
+        target = None
+        for arg in args:
+            if arg == "-l":
                 long_format = True
-                if len(args) > 1:
-                    path = args[1]
-            else:
-                path = args[0]
-        
-        # Normalize path
-        if not path.startswith("/"):
-            if self.kernel.cwd == "/":
-                path = "/" + path
-            else:
-                path = self.kernel.cwd + "/" + path
-        
-        # Ensure path ends with / for directory listing
-        if not path.endswith("/"):
-            path += "/"
-        
+            elif target is None:
+                target = arg
+        path = target if target is not None else self.kernel.cwd
+        try:
+            entries = self.kernel.list_directory(path, self.kernel.cwd)
+        except FileNotFoundError:
+            print(f"ls: cannot access '{path}': No such file or directory")
+            return
+        except NotADirectoryError:
+            entries = [self.kernel.get_entry(path, self.kernel.cwd)]
+
         if long_format:
             print(f"{'Mode':<10} {'Size':<8} {'Created':<20} {'Modified':<20} {'Name'}")
-            for name, info in sorted(self.kernel.files.items()):
-                # Show files in current directory only
-                if name.startswith(path) or (path == "/" and name.startswith("/")):
-                    # Don't show subdirectory contents
-                    rel_path = name[len(path):] if name.startswith(path) else name[1:]
-                    if "/" not in rel_path or path == "/":
-                        mode_str = "rwxrwxrwx"  # Simplified
-                        size = len(info["data"])
-                        created = time.ctime(info["created_time"])
-                        modified = time.ctime(info["modified_time"])
-                        print(f"{mode_str:<10} {size:<8} {created:<20} {modified:<20} {name}")
-        else:
-            for name in sorted(self.kernel.files.keys()):
-                # Show files in current directory only
-                if path == "/" and name.startswith("/"):
-                    # Root directory - show all files
-                    size = len(self.kernel.files[name]["data"])
-                    print(f"{name}\t{size} bytes")
-                elif name.startswith(path) and path != "/":
-                    # Subdirectory - show only files in this directory
-                    rel_path = name[len(path):]
-                    if "/" not in rel_path:
-                        size = len(self.kernel.files[name]["data"])
-                        print(f"{name}\t{size} bytes")
+
+        for entry_path, info in entries:
+            display_name = self.kernel.display_name(entry_path)
+            mode_str = "drwxr-xr-x" if info.get("is_dir") else "rw-r--r--"
+            size = len(info["data"])
+            created = time.ctime(info["created_time"])
+            modified = time.ctime(info["modified_time"])
+            if long_format:
+                print(f"{mode_str:<10} {size:<8} {created:<20} {modified:<20} {display_name}")
+            else:
+                print(f"{display_name}\t{size} bytes")
     def do_cat(self, args):
         if not args:
             print("Usage: cat <file>")
             return
         name = args[0]
-        if name not in self.kernel.files:
+        try:
+            _, data = self.kernel.read_file(name, self.kernel.cwd)
+        except FileNotFoundError:
             print("File not found:", name)
             return
-        data = self.kernel.files[name]["data"]
+        except IsADirectoryError:
+            print(f"{name} is a directory")
+            return
         try:
             print(data.decode("utf-8", errors="replace"))
         except Exception:
@@ -5049,30 +5749,15 @@ class Shell:
     def do_cd(self, args):
         """Change directory"""
         if not args:
-            # Go to home directory
-            self.kernel.cwd = self.kernel.env_vars.get("HOME", "/")
-            self.kernel.env_vars["PWD"] = self.kernel.cwd
-            return
-        path = args[0]
-        if path == "..":
-            # Go up one directory
-            if self.kernel.cwd != "/":
-                self.kernel.cwd = "/" + "/".join(self.kernel.cwd.strip("/").split("/")[:-1])
-                if not self.kernel.cwd:
-                    self.kernel.cwd = "/"
-        elif path.startswith("/"):
-            # Absolute path
-            self.kernel.cwd = path
+            target = self.kernel.env_vars.get("HOME", "/")
         else:
-            # Relative path
-            if self.kernel.cwd == "/":
-                self.kernel.cwd = "/" + path
-            else:
-                self.kernel.cwd = self.kernel.cwd + "/" + path
-        # Normalize path
-        self.kernel.cwd = "/" + "/".join(p for p in self.kernel.cwd.split("/") if p)
-        if not self.kernel.cwd:
-            self.kernel.cwd = "/"
+            target = args[0]
+        new_path = self.kernel.normalize_path(target, self.kernel.cwd)
+        entry = self.kernel.files.get(new_path)
+        if entry is None or not entry.get("is_dir", False):
+            print(f"cd: no such directory: {target}")
+            return
+        self.kernel.cwd = new_path
         self.kernel.env_vars["PWD"] = self.kernel.cwd
         print(f"Changed directory to: {self.kernel.cwd}")
     
@@ -5082,16 +5767,17 @@ class Shell:
             print("Usage: nano <file>")
             return
         filename = args[0]
-        
-        # Load existing file or create new
-        if filename in self.kernel.files:
-            try:
-                content = self.kernel.files[filename]["data"].decode("utf-8")
-            except Exception as e:
-                print("Error reading file:", e)
-                return
-        else:
+        try:
+            _, data = self.kernel.read_file(filename, self.kernel.cwd)
+            content = data.decode("utf-8")
+        except FileNotFoundError:
             content = ""
+        except IsADirectoryError:
+            print(f"{filename} is a directory")
+            return
+        except Exception as e:
+            print("Error reading file:", e)
+            return
         
         print(f"Nano Editor - Editing: {filename}")
         print("="*50)
@@ -5116,12 +5802,7 @@ class Shell:
                 if line == ":w":
                     # Save
                     new_content = "\n".join(new_lines)
-                    self.kernel.files[filename] = {
-                        "data": new_content.encode("utf-8"),
-                        "permissions": 0o644,
-                        "created_time": self.kernel.files.get(filename, {}).get("created_time", time.time()),
-                        "modified_time": time.time()
-                    }
+                    self.kernel.write_file(filename, new_content.encode("utf-8"), 0o644, self.kernel.cwd)
                     print(f"Saved {len(new_content)} bytes to {filename}")
                 elif line == ":q":
                     # Quit without saving
@@ -5130,12 +5811,7 @@ class Shell:
                 elif line == ":wq":
                     # Save and quit
                     new_content = "\n".join(new_lines)
-                    self.kernel.files[filename] = {
-                        "data": new_content.encode("utf-8"),
-                        "permissions": 0o644,
-                        "created_time": self.kernel.files.get(filename, {}).get("created_time", time.time()),
-                        "modified_time": time.time()
-                    }
+                    self.kernel.write_file(filename, new_content.encode("utf-8"), 0o644, self.kernel.cwd)
                     print(f"Saved {len(new_content)} bytes to {filename}")
                     break
                 else:
@@ -5152,25 +5828,102 @@ class Shell:
             return
         name = args[0]
         text = " ".join(args[1:])
-        self.kernel.files[name] = {
-            "data": text.encode("utf-8"),
-            "permissions": 0o644,
-            "created_time": time.time(),
-            "modified_time": time.time()
-        }
-        print(f"Wrote {len(text)} bytes to {name}")
+        self.kernel.write_file(name, text.encode("utf-8"), 0o644, self.kernel.cwd)
+        print(f"Wrote {len(text)} bytes to {self.kernel.normalize_path(name, self.kernel.cwd)}")
+    
+    def do_caspp(self, args):
+        """Compile C++ code using the cas++ compiler"""
+        if not args:
+            print("Usage: cas++ <source.cpp> [output.bin] [--run] [--asm] [--debug]")
+            return
+        run_after = "--run" in args
+        show_asm = "--asm" in args
+        debug_mode = "--debug" in args
+        positional = [arg for arg in args if not arg.startswith("--")]
+        if not positional:
+            print("Usage: cas++ <source.cpp> [output.bin] [--run] [--asm] [--debug]")
+            return
+        src = positional[0]
+        out_file = positional[1] if len(positional) > 1 else self._default_cpp_output(src)
+        abs_src, source_bytes = self._read_file_bytes(src)
+        if abs_src is None:
+            return
+        source_text = source_bytes.decode("utf-8", errors="replace")
+        compiler = CppCompiler()
+        try:
+            binary = compiler.compile(source_text)
+        except CppCompilerError as exc:
+            print(f"cas++ error: {exc}")
+            return
+        abs_out = self.kernel.write_file(out_file, binary, 0o755, self.kernel.cwd)
+        statement_count = compiler.functions.get("main", {}).get("statements", 0)
+        print(f"✓ cas++ compiled {abs_src} -> {abs_out} ({len(binary)} bytes)")
+        print(f"  Statements: {statement_count}")
+        print(f"  String literals: {len(compiler.string_literals)}")
+        if compiler.includes:
+            print(f"  Includes: {' '.join(compiler.includes)}")
+        if compiler.warnings:
+            print("Warnings:")
+            for warn in compiler.warnings:
+                print(f"  - {warn}")
+        if show_asm or debug_mode:
+            print("\nGenerated Assembly:")
+            print("=" * 60)
+            print(compiler.get_assembly_output())
+            print("=" * 60)
+        if run_after:
+            self.do_run([out_file])
+    
+    def do_cpp_help(self, args):
+        """Show C++ compiler help"""
+        print("cas++ - SimpleOS C++ Compiler")
+        print("=" * 40)
+        print("USAGE:")
+        print("  cas++ <source.cpp> [output.bin] [options]")
+        print()
+        print("OPTIONS:")
+        print("  --run     Compile and immediately execute the program")
+        print("  --asm     Display generated assembly output")
+        print("  --debug   Alias for --asm (kept for compatibility)")
+        print()
+        print("OTHER COMMANDS:")
+        print("  compilecpp  - Alias for cas++")
+        print("  cpprun      - Compile and run in a single step")
+        print("  c++         - Show this help screen")
+        print()
+        print("SUPPORTED FEATURES:")
+        print("  • #include lines (ignored but accepted for common headers)")
+        print("  • int / const int declarations with constant expressions")
+        print("  • Assignments to previously declared integers")
+        print("  • printf(\"text\"); statements (string literal only)")
+        print("  • return <expression>; (integers & simple arithmetic)")
+        print("Unsupported statements are ignored with warnings.")
+    
+    def do_compile_cpp(self, args):
+        """Alias for cas++"""
+        self.do_caspp(args)
+    
+    def do_run_cpp(self, args):
+        """Compile and immediately run a C++ program"""
+        if not args:
+            print("Usage: cpprun <source.cpp> [output.bin] [options]")
+            return
+        self.do_caspp(args + ["--run"])
     def do_loadasm(self, args):
         if len(args) < 2:
             print("Usage: loadasm <srcfile> <destfile>")
             return
         src = args[0]
         dest = args[1]
-        if src not in self.kernel.files:
+        try:
+            _, code_bytes = self.kernel.read_file(src, self.kernel.cwd)
+        except FileNotFoundError:
             print(f"Source file {src} not found")
             return
-        code = self.kernel.files[src]["data"]
-        if isinstance(code, bytes):
-            code = code.decode('utf-8', errors='replace')
+        except IsADirectoryError:
+            print(f"{src} is a directory")
+            return
+        code = code_bytes.decode('utf-8', errors='replace') if isinstance(code_bytes, bytes) else code_bytes
         assembler = Assembler()
         try:
             binary = assembler.assemble(code)
@@ -5183,12 +5936,7 @@ class Shell:
         except AssemblerError as e:
             print(f"Assembly error: {e}")
             return
-        self.kernel.files[dest] = {
-            "data": binary,
-            "permissions": 0o755,
-            "created_time": time.time(),
-            "modified_time": time.time()
-        }
+        self.kernel.write_file(dest, binary, 0o755, self.kernel.cwd)
         print(f"Assembled {len(binary)} bytes to {dest}")
         print(f"Labels: {list(assembler.labels.keys())}")
         print(f"Constants: {list(assembler.constants.keys())}")
@@ -5197,12 +5945,15 @@ class Shell:
             print("Usage: asminfo <file>")
             return
         filename = args[0]
-        if filename not in self.kernel.files:
+        try:
+            _, code_bytes = self.kernel.read_file(filename, self.kernel.cwd)
+        except FileNotFoundError:
             print(f"File {filename} not found")
             return
-        code = self.kernel.files[filename]["data"]
-        if isinstance(code, bytes):
-            code = code.decode('utf-8', errors='replace')
+        except IsADirectoryError:
+            print(f"{filename} is a directory")
+            return
+        code = code_bytes.decode('utf-8', errors='replace') if isinstance(code_bytes, bytes) else code_bytes
         assembler = Assembler()
         try:
             assembler.assemble(code)
@@ -5228,11 +5979,14 @@ class Shell:
         args = [arg for arg in args if not arg.startswith("--")]
         
         fname = args[0]
-        if fname not in self.kernel.files:
+        try:
+            abs_path, data = self.kernel.read_file(fname, self.kernel.cwd)
+        except FileNotFoundError:
             print(f"File not found: {fname}")
             return
-        
-        data = self.kernel.files[fname]["data"]
+        except IsADirectoryError:
+            print(f"{fname} is a directory")
+            return
         addr = int(args[1], 0) if len(args) > 1 else 0x1000
         
         # Load program into memory
@@ -5255,14 +6009,14 @@ class Shell:
         
         if debug_mode:
             print(f"=== DEBUG MODE ===")
-            print(f"File: {fname}")
+            print(f"File: {abs_path}")
             print(f"Load Address: {addr:08x}")
             print(f"Size: {len(data)} bytes")
             print(f"Initial PC: {self.cpu.pc:08x}")
             print(f"Initial SP: {self.cpu.reg_read(REG_SP):08x}")
             print("=" * 50)
         else:
-            print(f"Executing {fname} at {addr:08x} (size {len(data)} bytes).")
+            print(f"Executing {abs_path} at {addr:08x} (size {len(data)} bytes).")
         
         try:
             # Add max_steps to prevent infinite loops (10 million instructions)
@@ -5341,18 +6095,21 @@ class Shell:
         base_addr = 0x1000
         
         for i, fname in enumerate(files):
-            if fname not in self.kernel.files:
+            try:
+                abs_path, data = self.kernel.read_file(fname, self.kernel.cwd)
+            except FileNotFoundError:
                 print(f"File not found: {fname}")
                 return
-            
-            data = self.kernel.files[fname]["data"]
+            except IsADirectoryError:
+                print(f"{fname} is a directory")
+                return
             addr = base_addr + (i * 0x10000)  # Separate address space per thread
             
             # Load program into memory
             try:
                 self.cpu.mem.load_bytes(addr, data)
                 threads.append((addr, priority))
-                print(f"Loaded {fname} at {addr:08x} (size {len(data)} bytes)")
+                print(f"Loaded {abs_path} at {addr:08x} (size {len(data)} bytes)")
             except Exception as e:
                 print(f"Failed to load {fname}: {e}")
                 return
@@ -6262,7 +7019,25 @@ class Shell:
         print(f"  Cache Ratio: {stats['cache_ratio']:.2%}")
         print(f"  Protected Regions: {stats['protected_regions']}")
         print(f"  Breakpoints: {stats['breakpoints']}")
+        print(f"  Scrub Operations: {stats['scrub_operations']}")
     
+    def do_memscrub(self, args):
+        """Securely zero a memory region"""
+        if len(args) != 2:
+            print("Usage: memscrub <addr> <length>")
+            return
+        try:
+            addr = int(args[0], 0)
+            length = int(args[1], 0)
+        except ValueError:
+            print("Usage: memscrub <addr> <length>")
+            return
+        try:
+            self.cpu.mem.scrub(addr, length)
+            print(f"Scrubbed {length} bytes at 0x{addr:08X}")
+        except MemoryError as exc:
+            print(f"memscrub failed: {exc}")
+
     def do_meminfo(self, args):
         """Show detailed memory information"""
         print(self.cpu.mem.dump_stats())
@@ -6523,10 +7298,11 @@ error:
                 print(f"Error reading memory: {e}")
         else:
             # File
-            if target not in self.kernel.files:
+            file_path = self._resolve_path(target)
+            if file_path not in self.kernel.files:
                 print(f"File not found: {target}")
                 return
-            data = self.kernel.files[target]["data"][:length]
+            data = self.kernel.files[file_path]["data"][:length]
             self._print_hexdump(data, 0)
     
     def _print_hexdump(self, data, base_addr):
@@ -6543,13 +7319,12 @@ error:
             print("Usage: md5 <file>")
             return
         fname = args[0]
-        if fname not in self.kernel.files:
-            print(f"File not found: {fname}")
+        abs_fname, data = self._read_file_bytes(fname)
+        if abs_fname is None:
             return
         import hashlib
-        data = self.kernel.files[fname]["data"]
         md5_hash = hashlib.md5(data).hexdigest()
-        print(f"MD5 ({fname}) = {md5_hash}")
+        print(f"MD5 ({abs_fname}) = {md5_hash}")
     
     def do_sha256(self, args):
         """Calculate SHA256 hash of file"""
@@ -6557,13 +7332,12 @@ error:
             print("Usage: sha256 <file>")
             return
         fname = args[0]
-        if fname not in self.kernel.files:
-            print(f"File not found: {fname}")
+        abs_fname, data = self._read_file_bytes(fname)
+        if abs_fname is None:
             return
         import hashlib
-        data = self.kernel.files[fname]["data"]
         sha256_hash = hashlib.sha256(data).hexdigest()
-        print(f"SHA256 ({fname}) = {sha256_hash}")
+        print(f"SHA256 ({abs_fname}) = {sha256_hash}")
     
     def do_base64(self, args):
         """Base64 encode/decode file"""
@@ -6573,12 +7347,11 @@ error:
         operation = args[0].lower()
         fname = args[1]
         
-        if fname not in self.kernel.files:
-            print(f"File not found: {fname}")
+        abs_fname, data = self._read_file_bytes(fname)
+        if abs_fname is None:
             return
         
         import base64
-        data = self.kernel.files[fname]["data"]
         
         if operation == "encode":
             encoded = base64.b64encode(data).decode('utf-8')
@@ -6600,12 +7373,11 @@ error:
         operation = args[0].lower()
         fname = args[1]
         
-        if fname not in self.kernel.files:
-            print(f"File not found: {fname}")
+        abs_fname, data = self._read_file_bytes(fname)
+        if abs_fname is None:
             return
         
         import base64
-        data = self.kernel.files[fname]["data"]
         
         if operation == "encode":
             encoded = base64.b32encode(data).decode('utf-8')
@@ -6626,12 +7398,9 @@ error:
             return
         operation = args[0].lower()
         fname = args[1]
-        
-        if fname not in self.kernel.files:
-            print(f"File not found: {fname}")
+        abs_fname, data = self._read_file_bytes(fname)
+        if abs_fname is None:
             return
-        
-        data = self.kernel.files[fname]["data"]
         
         if operation == "encode":
             encoded = data.hex()
@@ -6651,14 +7420,10 @@ error:
             print("Usage: rot13 <file>")
             return
         fname = args[0]
-        
-        if fname not in self.kernel.files:
-            print(f"File not found: {fname}")
-            return
-        
         import codecs
-        data = self.kernel.files[fname]["data"]
-        text = data.decode('utf-8', errors='replace') if isinstance(data, bytes) else data
+        _, text = self._read_text(fname)
+        if text is None:
+            return
         result = codecs.encode(text, 'rot_13')
         print(result)
     
@@ -6668,13 +7433,9 @@ error:
             print("Usage: reverse <file>")
             return
         fname = args[0]
-        
-        if fname not in self.kernel.files:
-            print(f"File not found: {fname}")
+        _, text = self._read_text(fname)
+        if text is None:
             return
-        
-        data = self.kernel.files[fname]["data"]
-        text = data.decode('utf-8', errors='replace') if isinstance(data, bytes) else data
         print(text[::-1])
     
     def do_upper(self, args):
@@ -6683,13 +7444,9 @@ error:
             print("Usage: upper <file>")
             return
         fname = args[0]
-        
-        if fname not in self.kernel.files:
-            print(f"File not found: {fname}")
+        _, text = self._read_text(fname)
+        if text is None:
             return
-        
-        data = self.kernel.files[fname]["data"]
-        text = data.decode('utf-8', errors='replace') if isinstance(data, bytes) else data
         print(text.upper())
     
     def do_lower(self, args):
@@ -6698,13 +7455,9 @@ error:
             print("Usage: lower <file>")
             return
         fname = args[0]
-        
-        if fname not in self.kernel.files:
-            print(f"File not found: {fname}")
+        _, text = self._read_text(fname)
+        if text is None:
             return
-        
-        data = self.kernel.files[fname]["data"]
-        text = data.decode('utf-8', errors='replace') if isinstance(data, bytes) else data
         print(text.lower())
     
     def do_tr(self, args):
@@ -6715,13 +7468,9 @@ error:
         from_chars = args[0]
         to_chars = args[1]
         fname = args[2]
-        
-        if fname not in self.kernel.files:
-            print(f"File not found: {fname}")
+        _, text = self._read_text(fname)
+        if text is None:
             return
-        
-        data = self.kernel.files[fname]["data"]
-        text = data.decode('utf-8', errors='replace') if isinstance(data, bytes) else data
         trans = str.maketrans(from_chars, to_chars)
         print(text.translate(trans))
     
@@ -6738,16 +7487,12 @@ error:
         
         fields_str = args[1]
         fname = args[2]
-        
-        if fname not in self.kernel.files:
-            print(f"File not found: {fname}")
+        _, text = self._read_text(fname)
+        if text is None:
             return
         
         # Parse field numbers (1-indexed)
         fields = [int(f) - 1 for f in fields_str.split(',')]
-        
-        data = self.kernel.files[fname]["data"]
-        text = data.decode('utf-8', errors='replace') if isinstance(data, bytes) else data
         
         for line in text.splitlines():
             parts = line.split()
@@ -6767,12 +7512,9 @@ error:
             reverse = True
             fname = args[1]
         
-        if fname not in self.kernel.files:
-            print(f"File not found: {fname}")
+        _, text = self._read_text(fname)
+        if text is None:
             return
-        
-        data = self.kernel.files[fname]["data"]
-        text = data.decode('utf-8', errors='replace') if isinstance(data, bytes) else data
         lines = text.splitlines()
         lines.sort(reverse=reverse)
         for line in lines:
@@ -6784,13 +7526,9 @@ error:
             print("Usage: uniq <file>")
             return
         fname = args[0]
-        
-        if fname not in self.kernel.files:
-            print(f"File not found: {fname}")
+        _, text = self._read_text(fname)
+        if text is None:
             return
-        
-        data = self.kernel.files[fname]["data"]
-        text = data.decode('utf-8', errors='replace') if isinstance(data, bytes) else data
         lines = text.splitlines()
         
         prev = None
@@ -6811,13 +7549,9 @@ error:
         if args[0] == "-n" and len(args) > 2:
             count = int(args[1])
             fname = args[2]
-        
-        if fname not in self.kernel.files:
-            print(f"File not found: {fname}")
+        _, text = self._read_text(fname)
+        if text is None:
             return
-        
-        data = self.kernel.files[fname]["data"]
-        text = data.decode('utf-8', errors='replace') if isinstance(data, bytes) else data
         lines = text.splitlines()[:count]
         for line in lines:
             print(line)
@@ -6834,13 +7568,9 @@ error:
         if args[0] == "-n" and len(args) > 2:
             count = int(args[1])
             fname = args[2]
-        
-        if fname not in self.kernel.files:
-            print(f"File not found: {fname}")
+        _, text = self._read_text(fname)
+        if text is None:
             return
-        
-        data = self.kernel.files[fname]["data"]
-        text = data.decode('utf-8', errors='replace') if isinstance(data, bytes) else data
         lines = text.splitlines()[-count:]
         for line in lines:
             print(line)
@@ -6854,17 +7584,12 @@ error:
         file1 = args[0]
         file2 = args[1]
         
-        if file1 not in self.kernel.files:
-            print(f"File not found: {file1}")
+        _, text1 = self._read_text(file1)
+        if text1 is None:
             return
-        if file2 not in self.kernel.files:
-            print(f"File not found: {file2}")
+        _, text2 = self._read_text(file2)
+        if text2 is None:
             return
-        
-        data1 = self.kernel.files[file1]["data"]
-        data2 = self.kernel.files[file2]["data"]
-        text1 = data1.decode('utf-8', errors='replace') if isinstance(data1, bytes) else data1
-        text2 = data2.decode('utf-8', errors='replace') if isinstance(data2, bytes) else data2
         
         lines1 = text1.splitlines()
         lines2 = text2.splitlines()
@@ -6888,19 +7613,14 @@ error:
             print("Usage: touch <file>")
             return
         fname = args[0]
-        if fname in self.kernel.files:
-            # Update timestamp
-            self.kernel.files[fname]["modified_time"] = time.time()
-            print(f"Updated timestamp for {fname}")
+        abs_path = self._resolve_path(fname)
+        entry = self.kernel.files.get(abs_path)
+        if entry:
+            entry["modified_time"] = time.time()
+            print(f"Updated timestamp for {abs_path}")
         else:
-            # Create empty file
-            self.kernel.files[fname] = {
-                "data": b"",
-                "permissions": 0o644,
-                "created_time": time.time(),
-                "modified_time": time.time()
-            }
-            print(f"Created empty file {fname}")
+            self.kernel.write_file(abs_path, b"", 0o644, "/")
+            print(f"Created empty file {abs_path}")
     
     def do_du(self, args):
         """Disk usage"""
