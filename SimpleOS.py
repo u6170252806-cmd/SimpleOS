@@ -402,6 +402,13 @@ OP_ADDI = 0x151
 OP_SUBI = 0x152
 OP_MULI = 0x153
 OP_DIVI = 0x154
+OP_ANDI = 0x155
+OP_ORI = 0x156
+OP_XORI = 0x157
+OP_SHLI = 0x158
+OP_SHRI = 0x159
+OP_MULI = 0x153
+OP_DIVI = 0x154
 
 OPCODE_NAME = {
     OP_NOP: "NOP", OP_MOV: "MOV", OP_LOADI: "LOADI", OP_LOAD: "LOAD", OP_STORE: "STORE",
@@ -450,6 +457,7 @@ OPCODE_NAME = {
     OP_RANDOM: "RANDOM", OP_HASH: "HASH", OP_CRC32: "CRC32", OP_GETTIME: "GETTIME", OP_SLEEP: "SLEEP",
     OP_YIELD: "YIELD", OP_BARRIER: "BARRIER",
     OP_ADDI: "ADDI", OP_SUBI: "SUBI", OP_MULI: "MULI", OP_DIVI: "DIVI",
+    OP_ANDI: "ANDI", OP_ORI: "ORI", OP_XORI: "XORI", OP_SHLI: "SHLI", OP_SHRI: "SHRI",
     OP_SETG: "SETG", OP_SETLE: "SETLE", OP_SETGE: "SETGE", OP_SETNE: "SETNE", OP_SETE: "SETE",
     OP_LOOP: "LOOP", OP_LOOPZ: "LOOPZ", OP_LOOPNZ: "LOOPNZ",
     OP_REP: "REP", OP_REPZ: "REPZ", OP_REPNZ: "REPNZ",
@@ -3612,6 +3620,31 @@ class CPU:
                 res = int(orig / imm_val) & 0xFFFFFFFF
                 self.reg_write(dst, res)
                 self.update_arithmetic_flags(orig, imm_val, res)
+        elif opcode == OP_ANDI:
+            imm_val = to_signed16(imm16) & 0xFFFFFFFF
+            res = self.reg_read(dst) & imm_val
+            self.reg_write(dst, res)
+            self.update_zero_and_neg_flags(res)
+        elif opcode == OP_ORI:
+            imm_val = to_signed16(imm16) & 0xFFFFFFFF
+            res = self.reg_read(dst) | imm_val
+            self.reg_write(dst, res)
+            self.update_zero_and_neg_flags(res)
+        elif opcode == OP_XORI:
+            imm_val = to_signed16(imm16) & 0xFFFFFFFF
+            res = self.reg_read(dst) ^ imm_val
+            self.reg_write(dst, res)
+            self.update_zero_and_neg_flags(res)
+        elif opcode == OP_SHLI:
+            imm_val = to_signed16(imm16) & 0x1F
+            res = (self.reg_read(dst) << imm_val) & 0xFFFFFFFF
+            self.reg_write(dst, res)
+            self.update_zero_and_neg_flags(res)
+        elif opcode == OP_SHRI:
+            imm_val = to_signed16(imm16) & 0x1F
+            res = (self.reg_read(dst) >> imm_val) & 0xFFFFFFFF
+            self.reg_write(dst, res)
+            self.update_zero_and_neg_flags(res)
         elif opcode == OP_STRLEN:
             # String length: R0=string_addr, result in dst
             addr = self.reg_read(0) & 0xFFFFFFFF
@@ -4245,7 +4278,7 @@ class CPU:
             instr = self.mem.read_word(pc)
             opcode, dst, src, imm16 = unpack_instruction(instr)
             name = OPCODE_NAME.get(opcode, f"OP_{opcode:02x}")
-            if name in ("LOADI",):
+            if name in ("LOADI", "ADDI", "SUBI", "MULI", "DIVI", "ANDI", "ORI", "XORI", "SHLI", "SHRI"):
                 s = f"{pc:08x}: {name} R{dst}, {to_signed16(imm16)}"
             elif name in ("JMP", "JZ", "JNZ", "JE", "JNE", "JL", "JG", "JLE", "JGE", "CALL", "LOAD", "STORE", "INT"):
                 s = f"{pc:08x}: {name} {imm16} (0x{imm16:04x})"
@@ -4279,7 +4312,7 @@ class Assembler:
     LABEL:
     MNEMONIC operands ; comment
     Registers: R0..R15, ST0..ST7
-    Directives: .org, .word, .byte, .float, .double, .align, .space, .string, .include
+    Directives: .org, .word, .byte, .float, .double, .align, .space, .string, .ascii, .include
     """
     def __init__(self):
         self.labels: Dict[str, int] = {}
@@ -4293,6 +4326,7 @@ class Assembler:
         self.used_labels: set = set()
         self.include_paths: List[str] = ['.']  # Search paths for .include
         self.string_data: Dict[int, bytes] = {}  # address -> string data
+        self.incbin_cache: Dict[str, bytes] = {}
     def parse_reg(self, tok: str) -> int:
         tok = tok.upper().strip()
         if tok.startswith("R"):
@@ -4380,6 +4414,50 @@ class Assembler:
         except Exception as e:
             raise AssemblerError(f"Invalid expression '{expr}': {e}")
     
+    def _decode_string_literal(self, literal: str, line_num: int) -> bytes:
+        """Decode a quoted string literal into bytes"""
+        literal = literal.strip()
+        if not (literal.startswith('"') and literal.endswith('"')):
+            raise AssemblerError(f"Line {line_num}: String directive requires quoted literal")
+        try:
+            value = ast.literal_eval(literal)
+        except Exception as exc:
+            raise AssemblerError(f"Line {line_num}: Invalid string literal ({exc})")
+        if isinstance(value, bytes):
+            return value
+        if isinstance(value, str):
+            return value.encode('utf-8')
+        raise AssemblerError(f"Line {line_num}: Unsupported string literal type")
+
+    def _find_file(self, filename: str) -> Optional[str]:
+        search_locations = self.include_paths + [os.getcwd()]
+        for base in search_locations:
+            full_path = os.path.join(base, filename)
+            if os.path.isfile(full_path):
+                return full_path
+        return None
+
+    def _load_include_file(self, filename: str, line_num: int) -> List[str]:
+        """Load file contents for .include directive"""
+        resolved = self._find_file(filename)
+        if not resolved:
+            self.errors.append(f"Line {line_num}: Unable to include file '{filename}'")
+            return []
+        with open(resolved, 'r', encoding='utf-8') as f:
+            return f.read().splitlines()
+
+    def _load_binary_file(self, filename: str, line_num: int) -> bytes:
+        if filename in self.incbin_cache:
+            return self.incbin_cache[filename]
+        resolved = self._find_file(filename)
+        if not resolved:
+            self.errors.append(f"Line {line_num}: Unable to incbin file '{filename}'")
+            return b""
+        with open(resolved, 'rb') as f:
+            data = f.read()
+        self.incbin_cache[filename] = data
+        return data
+    
     def get_errors(self) -> List[str]:
         """Get list of assembly errors"""
         return self.errors
@@ -4463,6 +4541,31 @@ class Assembler:
                     self.constants[const_name] = const_value
                 except Exception as e:
                     self.errors.append(f"Line {i+1}: Invalid .equ value: {e}")
+                i += 1
+                continue
+            
+            elif line.startswith('.include'):
+                tokens = shlex.split(line)
+                if len(tokens) < 2:
+                    self.errors.append(f"Line {i+1}: .include requires a file path")
+                    i += 1
+                    continue
+                include_target = tokens[1].strip('"')
+                included_lines = self._load_include_file(include_target, i+1)
+                preprocessed_lines.extend(included_lines)
+                i += 1
+                continue
+            
+            elif line.startswith('.incbin'):
+                tokens = shlex.split(line)
+                if len(tokens) < 2:
+                    self.errors.append(f"Line {i+1}: .incbin requires a file path")
+                    i += 1
+                    continue
+                bin_target = tokens[1].strip('"')
+                data = self._load_binary_file(bin_target, i+1)
+                if data:
+                    preprocessed_lines.append(f".incbin \"{bin_target}\"")
                 i += 1
                 continue
             
@@ -4550,17 +4653,25 @@ class Assembler:
                     else:
                         pc += 1
                 elif directive == '.string':
-                    # Calculate string length
                     rest = line[len(tokens[0]):].strip()
                     if rest:
-                        # Parse string literal
-                        if rest.startswith('"') and rest.endswith('"'):
-                            string_content = rest[1:-1]
-                            # Handle escape sequences
-                            string_content = string_content.replace('\\n', '\n').replace('\\t', '\t').replace('\\\\', '\\')
-                            pc += len(string_content.encode('utf-8')) + 1  # +1 for null terminator
-                        else:
-                            self.errors.append(f"Line {i+1}: .string requires quoted string")
+                        try:
+                            string_bytes = self._decode_string_literal(rest, i+1)
+                            pc += len(string_bytes) + 1  # include null terminator
+                        except AssemblerError as exc:
+                            self.errors.append(str(exc))
+                    else:
+                        self.errors.append(f"Line {i+1}: .string requires quoted string")
+                elif directive == '.ascii':
+                    rest = line[len(tokens[0]):].strip()
+                    if rest:
+                        try:
+                            ascii_bytes = self._decode_string_literal(rest, i+1)
+                            pc += len(ascii_bytes)
+                        except AssemblerError as exc:
+                            self.errors.append(str(exc))
+                    else:
+                        self.errors.append(f"Line {i+1}: .ascii requires quoted string")
                 elif directive == '.float':
                     pc += 4
                 elif directive == '.double':
@@ -4585,6 +4696,22 @@ class Assembler:
                             pc += space
                         except Exception as e:
                             self.errors.append(f"Line {i+1}: Invalid .space value: {e}")
+                elif directive == '.incbin':
+                    if len(tokens) < 2:
+                        self.errors.append(f"Line {i+1}: .incbin requires file path")
+                    else:
+                        path = tokens[1].strip('"')
+                        data = self._load_binary_file(path, i+1)
+                        pc += len(data)
+                elif directive == '.incbin':
+                    rest = line[len(tokens[0]):].strip()
+                    filepath = rest.strip('"')
+                    data = self._load_binary_file(filepath, ln)
+                    if data:
+                        if pc + len(data) > len(out):
+                            out.extend(bytearray(pc + len(data) - len(out)))
+                        out[pc:pc+len(data)] = data
+                        pc += len(data)
                 elif directive in ['.equ', '.macro', '.endm', '.include']:
                     # Already handled in preprocessing
                     pass
@@ -4674,21 +4801,31 @@ class Assembler:
                         out[pc:pc+4] = itob_le(val)
                         pc += 4
                 elif directive == '.string':
-                    # Handle string directive
                     rest = line[len(tokens[0]):].strip()
-                    if rest and rest.startswith('"') and rest.endswith('"'):
-                        string_content = rest[1:-1]
-                        # Handle escape sequences
-                        string_content = string_content.replace('\\\\', '\x00')  # Temp placeholder
-                        string_content = string_content.replace('\\n', '\n').replace('\\t', '\t').replace('\\r', '\r').replace('\\"', '"')
-                        string_content = string_content.replace('\x00', '\\')  # Restore backslash
-                        string_bytes = string_content.encode('utf-8') + b'\x00' # null terminator
-                        if pc + len(string_bytes) > len(out):
-                            out.extend(bytearray(pc + len(string_bytes) - len(out)))
-                        out[pc:pc+len(string_bytes)] = string_bytes
-                        pc += len(string_bytes)
+                    if rest:
+                        try:
+                            string_bytes = self._decode_string_literal(rest, ln) + b'\x00'
+                            if pc + len(string_bytes) > len(out):
+                                out.extend(bytearray(pc + len(string_bytes) - len(out)))
+                            out[pc:pc+len(string_bytes)] = string_bytes
+                            pc += len(string_bytes)
+                        except AssemblerError as exc:
+                            self.errors.append(str(exc))
                     else:
                         self.errors.append(f"Line {ln}: .string requires quoted string")
+                elif directive == '.ascii':
+                    rest = line[len(tokens[0]):].strip()
+                    if rest:
+                        try:
+                            ascii_bytes = self._decode_string_literal(rest, ln)
+                            if pc + len(ascii_bytes) > len(out):
+                                out.extend(bytearray(pc + len(ascii_bytes) - len(out)))
+                            out[pc:pc+len(ascii_bytes)] = ascii_bytes
+                            pc += len(ascii_bytes)
+                        except AssemblerError as exc:
+                            self.errors.append(str(exc))
+                    else:
+                        self.errors.append(f"Line {ln}: .ascii requires quoted string")
                 elif directive == '.align':
                     # Align to boundary
                     if len(tokens) >= 2:
@@ -4761,7 +4898,7 @@ class Assembler:
                     imm = self.resolve_label_token(imm)
                     imm_val = self.parse_imm(imm)
                     word = pack_instruction(opcode, dst, 0, imm_val & 0xFFFF)
-                elif opcode in (OP_ADDI, OP_SUBI, OP_MULI, OP_DIVI):
+                elif opcode in (OP_ADDI, OP_SUBI, OP_MULI, OP_DIVI, OP_ANDI, OP_ORI, OP_XORI, OP_SHLI, OP_SHRI):
                     if len(args) != 2:
                         raise AssemblerError(f"{mnem} requires register and immediate")
                     dst = self.parse_reg(args[0])
@@ -4900,7 +5037,12 @@ class CppCompiler:
         self.warnings: List[str] = []
         self.last_assembly: str = ""
         self.variables: Dict[str, int] = {}
+        self.const_variables: set = set()
+        self.var_registers: Dict[str, str] = {}
+        self.var_register_pool: List[str] = ["R4", "R5", "R6", "R7", "R8"]
+        self.temp_register_pool: List[str] = ["R11", "R10", "R9"]
         self.includes: List[str] = []
+        self.label_counter = 0
 
     PROGRAM_BASE = 0x1000
 
@@ -4939,6 +5081,8 @@ class CppCompiler:
             binary = assembler.assemble(self.last_assembly)
         except AssemblerError as exc:
             raise CppCompilerError(str(exc)) from exc
+        if self.PROGRAM_BASE and len(binary) > self.PROGRAM_BASE:
+            binary = binary[self.PROGRAM_BASE:]
         self.functions["main"] = {"statements": len(statements)}
         return binary
 
@@ -4997,6 +5141,7 @@ class CppCompiler:
         current: List[str] = []
         in_string = False
         escape = False
+        brace_depth = 0
         for ch in body:
             if in_string:
                 current.append(ch)
@@ -5011,16 +5156,36 @@ class CppCompiler:
                 in_string = True
                 current.append(ch)
                 continue
-            if ch == ';':
+            if ch == '{':
+                brace_depth += 1
+                current.append(ch)
+                continue
+            if ch == '}':
+                current.append(ch)
+                if brace_depth > 0:
+                    brace_depth -= 1
+                if brace_depth == 0 and current:
+                    statements.append("".join(current))
+                    current = []
+                continue
+            if ch == ';' and brace_depth == 0:
                 statements.append("".join(current))
                 current = []
-            elif ch in "{}":
-                continue
             else:
                 current.append(ch)
         if current:
             statements.append("".join(current))
-        return statements
+        merged: List[str] = []
+        for stmt in statements:
+            stripped = stmt.strip()
+            if stripped.startswith("else"):
+                if merged:
+                    merged[-1] += (" " if not merged[-1].endswith(" ") else "") + stripped
+                else:
+                    merged.append(stmt)
+            else:
+                merged.append(stmt)
+        return merged
 
     def _translate_statement(self, stmt: str) -> Tuple[List[str], bool]:
         stmt = stmt.strip()
@@ -5030,12 +5195,14 @@ class CppCompiler:
             return self._translate_printf(stmt), False
         if stmt.startswith("return"):
             return self._translate_return(stmt), True
+        if stmt.startswith("if"):
+            return self._translate_if(stmt), False
+        if stmt.startswith("while"):
+            return self._translate_while(stmt), False
         if stmt.startswith("int ") or stmt.startswith("const int"):
-            self._handle_declaration(stmt)
-            return [], False
+            return self._compile_declaration(stmt), False
         if "=" in stmt and stmt.split("=")[0].strip().isidentifier():
-            self._handle_assignment(stmt)
-            return [], False
+            return self._compile_assignment(stmt), False
         self.warnings.append(f"Unsupported statement ignored: {stmt}")
         return [], False
 
@@ -5075,14 +5242,170 @@ class CppCompiler:
         expr = stmt[len("return"):].strip()
         if expr.endswith(";"):
             expr = expr[:-1].strip()
-        if not expr:
-            imm = 0
+        if expr:
+            node = self._parse_expression_node(expr)
         else:
-            imm = self._evaluate_expression(expr)
-        return [
-            "    ; return statement",
-            f"    LOADI R0, {imm & 0xFFFFFFFF}"
-        ]
+            node = ast.Constant(value=0)
+        code = ["    ; return statement"]
+        code.extend(self._emit_expression_to_register(node, "R0"))
+        return code
+    
+    def _translate_if(self, stmt: str) -> List[str]:
+        condition, remainder = self._extract_parenthesized(stmt)
+        remainder = remainder.strip()
+        if not remainder:
+            raise CppCompilerError("if statement missing body")
+        true_code: List[str] = []
+        else_code: List[str] = []
+        tail = ""
+        if remainder.startswith("{"):
+            block_body, tail = self._extract_block(remainder)
+            true_code = self._compile_block(block_body)
+        else:
+            inner_code, _ = self._translate_statement(remainder)
+            true_code = inner_code
+        tail = tail.strip()
+        if tail.startswith("else"):
+            tail_body = tail[4:].strip()
+            if tail_body.startswith("if"):
+                else_code = self._translate_if(tail_body)
+                tail = ""
+            elif tail_body.startswith("{"):
+                else_body, leftover = self._extract_block(tail_body)
+                else_code = self._compile_block(else_body)
+                tail = leftover.strip()
+            else:
+                code, _ = self._translate_statement(tail_body)
+                else_code = code
+                tail = ""
+        if tail:
+            tail = tail.strip()
+            if tail:
+                self.warnings.append(f"Ignoring unexpected tokens after else block: {tail}")
+        cond_lines, false_jump = self._emit_condition_code(condition)
+        lines: List[str] = []
+        lines.extend(cond_lines)
+        if else_code:
+            else_label = self._new_label("if_else")
+            end_label = self._new_label("if_end")
+            lines.append(f"    {false_jump} {else_label}")
+            lines.extend(true_code)
+            lines.append(f"    JMP {end_label}")
+            lines.append(f"{else_label}:")
+            lines.extend(else_code)
+            lines.append(f"{end_label}:")
+        else:
+            end_label = self._new_label("if_end")
+            lines.append(f"    {false_jump} {end_label}")
+            lines.extend(true_code)
+            lines.append(f"{end_label}:")
+        return lines
+
+    def _translate_while(self, stmt: str) -> List[str]:
+        condition, remainder = self._extract_parenthesized(stmt)
+        remainder = remainder.strip()
+        if not remainder:
+            raise CppCompilerError("while statement missing body")
+        if remainder.startswith("{"):
+            body_text, tail = self._extract_block(remainder)
+            if tail.strip():
+                self.warnings.append(f"Ignoring tokens after while block: {tail.strip()}")
+            body_code = self._compile_block(body_text)
+        else:
+            body_code, _ = self._translate_statement(remainder)
+        start_label = self._new_label("while_begin")
+        end_label = self._new_label("while_end")
+        cond_code, false_jump = self._emit_condition_code(condition)
+        lines = [f"{start_label}:"]
+        lines.extend(cond_code)
+        lines.append(f"    {false_jump} {end_label}")
+        lines.extend(body_code)
+        lines.append(f"    JMP {start_label}")
+        lines.append(f"{end_label}:")
+        return lines
+
+    def _compile_block(self, block_text: str) -> List[str]:
+        lines: List[str] = []
+        for stmt in self._split_statements(block_text):
+            stmt = stmt.strip()
+            if not stmt:
+                continue
+            code, _ = self._translate_statement(stmt)
+            lines.extend(code)
+        return lines
+
+    def _new_label(self, prefix: str = "L") -> str:
+        label = f"{prefix}_{self.label_counter}"
+        self.label_counter += 1
+        return label
+
+    def _extract_parenthesized(self, stmt: str) -> Tuple[str, str]:
+        start = stmt.find('(')
+        if start == -1:
+            raise CppCompilerError("Missing '(' in if statement")
+        depth = 0
+        expr_start = start + 1
+        for i in range(start, len(stmt)):
+            ch = stmt[i]
+            if ch == '(':
+                depth += 1
+            elif ch == ')':
+                depth -= 1
+                if depth == 0:
+                    return stmt[expr_start:i], stmt[i+1:]
+        raise CppCompilerError("Unmatched parentheses in if condition")
+
+    def _extract_block(self, text: str) -> Tuple[str, str]:
+        if not text.startswith("{"):
+            raise CppCompilerError("Expected '{' to start block")
+        depth = 0
+        start = 1
+        for i, ch in enumerate(text):
+            if ch == '{':
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0:
+                    return text[start:i], text[i+1:]
+        raise CppCompilerError("Unmatched braces in block")
+
+    def _parse_condition(self, condition: str) -> Tuple[str, Optional[str], Optional[str]]:
+        condition = condition.strip()
+        for op in ("==", "!=", ">=", "<=", ">", "<"):
+            idx = condition.find(op)
+            if idx != -1:
+                left = condition[:idx].strip()
+                right = condition[idx + len(op):].strip()
+                return left, op, right
+        return condition, None, None
+
+    def _emit_condition_code(self, condition: str) -> Tuple[List[str], str]:
+        left_expr, operator, right_expr = self._parse_condition(condition)
+        code: List[str] = []
+        left_reg = self._acquire_temp_register()
+        code.extend(self._emit_expression_to_register(self._parse_expression_node(left_expr), left_reg))
+        jump = "JE"
+        if operator:
+            right_reg = self._acquire_temp_register()
+            code.extend(self._emit_expression_to_register(self._parse_expression_node(right_expr), right_reg))
+            code.append(f"    CMP {left_reg}, {right_reg}")
+            jump = {
+                "==": "JNE",
+                "!=": "JE",
+                ">": "JLE",
+                ">=": "JL",
+                "<": "JGE",
+                "<=": "JG",
+            }[operator]
+            self._release_temp_register(right_reg)
+        else:
+            zero_reg = self._acquire_temp_register()
+            code.extend(self._emit_load_immediate(zero_reg, 0))
+            code.append(f"    CMP {left_reg}, {zero_reg}")
+            jump = "JE"
+            self._release_temp_register(zero_reg)
+        self._release_temp_register(left_reg)
+        return code, jump
 
     def _add_string_literal(self, literal: str) -> str:
         if literal in self._string_map:
@@ -5148,7 +5471,13 @@ class CppCompiler:
                 args.append(trailing)
         return args
 
-    def _handle_declaration(self, stmt: str):
+    def _parse_expression_node(self, expr: str):
+        try:
+            return ast.parse(expr, mode="eval").body
+        except SyntaxError as exc:
+            raise CppCompilerError(f"Invalid expression '{expr}': {exc}")
+
+    def _compile_declaration(self, stmt: str) -> List[str]:
         stmt = stmt.rstrip(";")
         match = re.match(r'(const\s+)?int\s+([A-Za-z_]\w*)(\s*=\s*(.+))?$', stmt)
         if not match:
@@ -5156,26 +5485,147 @@ class CppCompiler:
         is_const = bool(match.group(1))
         name = match.group(2)
         init_expr = match.group(4)
-        if init_expr is not None:
-            value = self._evaluate_expression(init_expr.strip())
+        if name in self.var_registers:
+            raise CppCompilerError(f"Variable '{name}' already declared")
+        reg = self._allocate_var_register(name)
+        code: List[str] = []
+        if init_expr:
+            node = self._parse_expression_node(init_expr.strip())
+            code.extend(self._emit_expression_to_register(node, reg))
+            self.variables[name] = self._evaluate_expression(init_expr.strip())
         else:
-            value = 0
-        if name in self.variables:
-            self.warnings.append(f"Redeclaring variable {name}")
-        self.variables[name] = value
-        if is_const and init_expr is None:
-            raise CppCompilerError(f"const int {name} requires initialization")
+            if is_const:
+                raise CppCompilerError(f"const int {name} requires initialization")
+            code.append(f"    LOADI {reg}, 0")
+            self.variables[name] = 0
+        if is_const:
+            self.const_variables.add(name)
+        return code
 
-    def _handle_assignment(self, stmt: str):
+    def _compile_assignment(self, stmt: str) -> List[str]:
         stmt = stmt.rstrip(";")
         parts = stmt.split("=", 1)
         if len(parts) != 2:
             raise CppCompilerError(f"Invalid assignment: {stmt}")
         name = parts[0].strip()
         expr = parts[1].strip()
-        if name not in self.variables:
-            raise CppCompilerError(f"Assignment to undeclared variable '{name}'")
+        if name in self.const_variables:
+            raise CppCompilerError(f"Cannot assign to const variable '{name}'")
+        reg = self._require_variable(name)
+        node = self._parse_expression_node(expr)
+        code = self._emit_expression_to_register(node, reg)
         self.variables[name] = self._evaluate_expression(expr)
+        return code
+
+    def _allocate_var_register(self, name: str) -> str:
+        if not self.var_register_pool:
+            raise CppCompilerError("Out of registers for variable allocation")
+        reg = self.var_register_pool.pop(0)
+        self.var_registers[name] = reg
+        return reg
+
+    def _require_variable(self, name: str) -> str:
+        if name not in self.var_registers:
+            raise CppCompilerError(f"Use of undeclared variable '{name}'")
+        return self.var_registers[name]
+
+    def _acquire_temp_register(self) -> str:
+        if not self.temp_register_pool:
+            raise CppCompilerError("Out of temporary registers for expression evaluation")
+        return self.temp_register_pool.pop()
+
+    def _release_temp_register(self, reg: str):
+        self.temp_register_pool.append(reg)
+
+    def _emit_load_immediate(self, target: str, value: int) -> List[str]:
+        if value < -32768 or value > 32767:
+            raise CppCompilerError("Immediate value out of range for LOADI (must fit 16-bit signed)")
+        return [f"    LOADI {target}, {value}"]
+
+    def _emit_expression_to_register(self, node, target: str) -> List[str]:
+        code: List[str] = []
+        const_val = self._try_constant_value(node)
+        if const_val is not None:
+            code.extend(self._emit_load_immediate(target, const_val))
+            return code
+        if isinstance(node, ast.UnaryOp):
+            code.extend(self._emit_expression_to_register(node.operand, target))
+            if isinstance(node.op, ast.USub):
+                code.append(f"    NEG {target}")
+            elif isinstance(node.op, ast.UAdd):
+                pass
+            else:
+                raise CppCompilerError("Unsupported unary operator")
+            return code
+        if isinstance(node, ast.Name):
+            src = self._require_variable(node.id)
+            if src != target:
+                code.append(f"    MOV {target}, {src}")
+            return code
+        if isinstance(node, ast.BinOp):
+            code.extend(self._emit_expression_to_register(node.left, target))
+            rhs_code, rhs_reg, should_release = self._load_operand(node.right)
+            code.extend(rhs_code)
+            code.extend(self._emit_binop(node.op, target, rhs_reg))
+            if should_release:
+                self._release_temp_register(rhs_reg)
+            return code
+        raise CppCompilerError("Unsupported expression construct")
+
+    def _load_operand(self, node) -> Tuple[List[str], str, bool]:
+        if isinstance(node, ast.Name):
+            return [], self._require_variable(node.id), False
+        const_val = self._try_constant_value(node)
+        if const_val is not None:
+            tmp = self._acquire_temp_register()
+            return self._emit_load_immediate(tmp, const_val), tmp, True
+        tmp = self._acquire_temp_register()
+        code = self._emit_expression_to_register(node, tmp)
+        return code, tmp, True
+
+    def _emit_binop(self, op, target: str, rhs_reg: str) -> List[str]:
+        if isinstance(op, ast.Add):
+            return [f"    ADD {target}, {rhs_reg}"]
+        if isinstance(op, ast.Sub):
+            return [f"    SUB {target}, {rhs_reg}"]
+        if isinstance(op, ast.Mult):
+            return [f"    MUL {target}, {rhs_reg}"]
+        if isinstance(op, ast.Div) or isinstance(op, ast.FloorDiv):
+            return [f"    DIV {target}, {rhs_reg}"]
+        if isinstance(op, ast.Mod):
+            return [f"    MOD {target}, {rhs_reg}"]
+        raise CppCompilerError("Unsupported binary operator")
+
+    def _try_constant_value(self, node) -> Optional[int]:
+        if isinstance(node, ast.Constant):
+            if isinstance(node.value, (int, float, bool)):
+                return int(node.value)
+            return None
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+            inner = self._try_constant_value(node.operand)
+            if inner is None:
+                return None
+            return inner if isinstance(node.op, ast.UAdd) else -inner
+        if isinstance(node, ast.BinOp):
+            left = self._try_constant_value(node.left)
+            right = self._try_constant_value(node.right)
+            if left is None or right is None:
+                return None
+            if isinstance(node.op, ast.Add):
+                return left + right
+            if isinstance(node.op, ast.Sub):
+                return left - right
+            if isinstance(node.op, ast.Mult):
+                return left * right
+            if isinstance(node.op, (ast.Div, ast.FloorDiv)):
+                if right == 0:
+                    return None
+                return left // right
+            if isinstance(node.op, ast.Mod):
+                if right == 0:
+                    return None
+                return left % right
+        return None
 
     def _evaluate_expression(self, expr: str) -> int:
         try:
@@ -5279,6 +5729,8 @@ class Shell:
     grep <pattern> <file> - search within file
     wc <file> - count lines, words, characters in a file
     memscrub <addr> <len> - securely zero a memory range
+    self-repair [target] - run automatic repairs on components
+    diagnose [component] - run system diagnostics and self-repair
     """
     def __init__(self, kernel: Kernel, cpu: CPU, assembler: Assembler, bios: BIOS):
         self.kernel = kernel
@@ -5385,6 +5837,9 @@ class Shell:
                         print("  env       - Show environment variables")
                         print("  export    - Set environment variable")
                         print("  unset     - Remove environment variable")
+                        print("  diagnose  - Run system diagnostics")
+                        print("  self-repair - Attempt automated repairs")
+                        print("  diagnose  - Run system diagnostics and self-repair")
                     elif category == "file":
                         print("File Commands:")
                         print("  ls        - List files")
@@ -5483,6 +5938,10 @@ class Shell:
                     self.do_cat(args)
                 elif cmd == "nano":
                     self.do_nano(args)
+                elif cmd == "diagnose":
+                    self.do_diagnose(args)
+                elif cmd == "self-repair":
+                    self.do_self_repair(args)
                 elif cmd == "cas++":
                     self.do_caspp(args)
                 elif cmd == "c++":
@@ -5894,8 +6353,10 @@ class Shell:
         print("SUPPORTED FEATURES:")
         print("  • #include lines (ignored but accepted for common headers)")
         print("  • int / const int declarations with constant expressions")
+        print("  • Mutable int variables mapped to CPU registers (R4-R8)")
+        print("  • Arithmetic expressions using +, -, *, /, % and parentheses")
         print("  • Assignments to previously declared integers")
-        print("  • printf(\"text\"); statements (string literal only)")
+        print("  • printf(\"text\", value1, value2, ...); with %d placeholders")
         print("  • return <expression>; (integers & simple arithmetic)")
         print("Unsupported statements are ignored with warnings.")
     
@@ -7621,6 +8082,126 @@ error:
         else:
             self.kernel.write_file(abs_path, b"", 0o644, "/")
             print(f"Created empty file {abs_path}")
+
+    def do_diagnose(self, args):
+        """Run system diagnostics and auto-repair components."""
+        target = args[0].lower() if args else "all"
+        mapping = {
+            "cpu": self._diagnose_cpu,
+            "ram": self._diagnose_memory,
+            "memory": self._diagnose_memory,
+            "kernel": self._diagnose_kernel,
+            "bios": self._diagnose_bios,
+        }
+        if target != "all" and target not in mapping:
+            print("Usage: diagnose [cpu|ram|kernel|bios|all]")
+            return
+        sequence = ["cpu", "ram", "kernel", "bios"]
+        report = []
+        for name in sequence:
+            if target in ("all", name):
+                result = mapping[name]()
+                report.append((name, result))
+                self._print_diagnose_result(name, result)
+        if target == "all":
+            print("\nSystem diagnostics complete.")
+            statuses = {name: res["status"] for name, res in report}
+            print(f"Summary: CPU {statuses['cpu']}, RAM {statuses['ram']}, Kernel {statuses['kernel']}, BIOS {statuses['bios']}")
+
+    def _print_diagnose_result(self, name: str, result: Dict[str, Any]):
+        header = f"[{name.upper()}]"
+        print(f"\n{header} Status: {result['status']}")
+        for key, val in result["info"].items():
+            print(f"  {key}: {val}")
+        if result["actions"]:
+            print("  Repairs:")
+            for action in result["actions"]:
+                print(f"    - {action}")
+
+    def _diagnose_cpu(self) -> Dict[str, Any]:
+        info = {
+            "clock_mhz": 125.0,
+            "pc": f"0x{self.cpu.pc:08x}",
+            "sp": f"0x{self.cpu.reg_read(REG_SP):08x}",
+            "flags": f"0x{self.cpu.flags:08x}",
+            "features": ", ".join(self.kernel.system_info.get("features", [])),
+        }
+        actions = []
+        if self.cpu.halted:
+            self.cpu.halted = False
+            actions.append("CPU halted flag cleared")
+        status = "OK" if not actions else "REPAIRED"
+        return {"status": status, "info": info, "actions": actions}
+
+    def _diagnose_memory(self) -> Dict[str, Any]:
+        stats = self.cpu.mem.get_stats()
+        info = {
+            "size_mb": f"{stats['total_size'] / (1024*1024):.1f}",
+            "reads": stats["total_reads"],
+            "writes": stats["total_writes"],
+            "cache_ratio": f"{stats['cache_ratio']:.2%}",
+            "protected_regions": stats["protected_regions"],
+            "scrubs": stats.get("scrub_operations", 0),
+        }
+        actions = []
+        total_accesses = stats["total_reads"] + stats["total_writes"]
+        if total_accesses > 200 and stats["cache_ratio"] < 0.05:
+            self.cpu.mem.clear_cache()
+            actions.append("Cache cleared due to poor cache ratio")
+        status = "OK" if not actions else "REPAIRED"
+        return {"status": status, "info": info, "actions": actions}
+
+    def _diagnose_kernel(self) -> Dict[str, Any]:
+        uptime = time.time() - self.kernel.start_time
+        info = {
+            "processes": len(self.kernel.processes),
+            "files": len(self.kernel.files),
+            "cwd": self.kernel.cwd,
+            "uptime": f"{uptime:.1f}s",
+        }
+        actions = []
+        if not self.kernel.running:
+            self.kernel.running = True
+            actions.append("Kernel marked as running")
+        status = "OK" if not actions else "REPAIRED"
+        return {"status": status, "info": info, "actions": actions}
+
+    def _diagnose_bios(self) -> Dict[str, Any]:
+        info = {
+            "version": getattr(self.bios, "version", "1.1"),
+            "vendor": getattr(self.bios, "vendor", "SimpleOS"),
+            "last_boot": time.ctime(self.kernel.start_time),
+        }
+        actions: List[str] = []
+        status = "OK"
+        return {"status": status, "info": info, "actions": actions}
+
+    def do_self_repair(self, args):
+        """Attempt automatic repairs on system components."""
+        target = args[0].lower() if args else "all"
+        mapping = {
+            "cpu": self._diagnose_cpu,
+            "ram": self._diagnose_memory,
+            "memory": self._diagnose_memory,
+            "kernel": self._diagnose_kernel,
+            "bios": self._diagnose_bios,
+        }
+        if target != "all" and target not in mapping:
+            print("Usage: self-repair [cpu|ram|kernel|bios|all]")
+            return
+        print("Initiating self-repair routines...")
+        order = ["cpu", "ram", "kernel", "bios"]
+        for comp in order:
+            if target not in ("all", comp):
+                continue
+            result = mapping[comp]()
+            if result["actions"]:
+                print(f"[{comp.upper()}] Repairs applied:")
+                for action in result["actions"]:
+                    print(f"  - {action}")
+            else:
+                print(f"[{comp.upper()}] No issues detected")
+        print("Self-repair sequence complete.")
     
     def do_du(self, args):
         """Disk usage"""
