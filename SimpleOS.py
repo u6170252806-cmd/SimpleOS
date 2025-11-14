@@ -472,14 +472,17 @@ OP_LOCK: "LOCK", OP_REPNE: "REPNE", OP_REPE: "REPE",
 NAME_OPCODE = {v: k for k, v in OPCODE_NAME.items()}
 
 # Memory region constants
-STACK_BASE = 0x7FFF0000  # Stack grows downward from here
-STACK_SIZE = 0x00010000  # 64KB stack
-HEAP_BASE = 0x10000000   # Heap starts here
-HEAP_SIZE = 0x70000000   # 1.8GB heap
-CODE_BASE = 0x00001000   # Code segment
-CODE_SIZE = 0x0FFF0000   # ~256MB code
-DATA_BASE = 0x08000000   # Data segment
-DATA_SIZE = 0x08000000   # 128MB data
+# For the current 64MB default memory, place the stack just below the BIOS
+# ROM region (last 64KB of memory). The stack grows downward from STACK_BASE
+# and remains entirely inside valid RAM.
+STACK_SIZE = 0x00010000                  # 64KB stack
+STACK_BASE = DEFAULT_MEMORY_BYTES - STACK_SIZE  # Top of stack (grows downward)
+HEAP_BASE = 0x10000000                   # Logical heap base (may be virtual)
+HEAP_SIZE = 0x70000000                   # Logical heap size
+CODE_BASE = 0x00001000                   # Code segment
+CODE_SIZE = 0x0FFF0000                   # ~256MB code
+DATA_BASE = 0x08000000                   # Data segment
+DATA_SIZE = 0x08000000                   # 128MB data
 
 FLAG_NAME_MAP = {
     "ZERO": FLAG_ZERO, "NEG": FLAG_NEG, "CARRY": FLAG_CARRY, "OVERFLOW": FLAG_OVERFLOW,
@@ -3539,7 +3542,7 @@ class CPU:
             val = self.reg_read(src) & 0xFF
             self.reg_write(dst, val)
             self.update_zero_and_neg_flags(val)
-        elif opcode == OP_POPCNT:
+        elif opcode == OP_POPCNT or opcode == OP_POPCOUNT:
             # Population count - count number of set bits
             val = self.reg_read(src)
             count = 0
@@ -4890,6 +4893,12 @@ class Assembler:
                         imm = self.resolve_label_token(args[1])
                         imm_val = self.parse_imm(imm) & 0xFFFF
                         word = pack_instruction(opcode, dst, src, imm_val)
+                elif opcode in (OP_CLAMP, OP_RANDOM):
+                    # One-operand utility instructions
+                    if len(args) != 1:
+                        raise AssemblerError(f"{mnem} requires one register operand on line {ln}")
+                    dst = self.parse_reg(args[0])
+                    word = pack_instruction(opcode, dst, 0, 0)
                 elif opcode == OP_LOADI:
                     if len(args) != 2:
                         raise AssemblerError("LOADI requires two operands")
@@ -5039,10 +5048,18 @@ class CppCompiler:
         self.variables: Dict[str, int] = {}
         self.const_variables: set = set()
         self.var_registers: Dict[str, str] = {}
-        self.var_register_pool: List[str] = ["R4", "R5", "R6", "R7", "R8"]
-        self.temp_register_pool: List[str] = ["R11", "R10", "R9"]
+        self.struct_definitions: Dict[str, List[str]] = {}
+        self.struct_instances: Dict[str, Dict[str, Any]] = {}
+        self.struct_pointers: Dict[str, str] = {}
+        # Registers dedicated to holding cas++ variables in main(). Avoid R0-R3 (syscalls/return),
+        # R13 (kernel), R14 (SP), and R15 (PC).
+        self.var_register_pool: List[str] = ["R4", "R5", "R6", "R7", "R8", "R9", "R10", "R11", "R12"]
+        # Temporary registers for expression evaluation. These are caller/callee-clobbered and never
+        # used to hold persistent variables or stack pointers.
+        self.temp_register_pool: List[str] = ["R13", "R3", "R2", "R1"]
         self.includes: List[str] = []
         self.label_counter = 0
+        self.loop_stack: List[Dict[str, str]] = []
 
     PROGRAM_BASE = 0x1000
 
@@ -5142,6 +5159,7 @@ class CppCompiler:
         in_string = False
         escape = False
         brace_depth = 0
+        paren_depth = 0
         for ch in body:
             if in_string:
                 current.append(ch)
@@ -5156,6 +5174,11 @@ class CppCompiler:
                 in_string = True
                 current.append(ch)
                 continue
+            if ch == '(':
+                paren_depth += 1
+            elif ch == ')':
+                if paren_depth > 0:
+                    paren_depth -= 1
             if ch == '{':
                 brace_depth += 1
                 current.append(ch)
@@ -5168,7 +5191,7 @@ class CppCompiler:
                     statements.append("".join(current))
                     current = []
                 continue
-            if ch == ';' and brace_depth == 0:
+            if ch == ';' and brace_depth == 0 and paren_depth == 0:
                 statements.append("".join(current))
                 current = []
             else:
@@ -5183,6 +5206,8 @@ class CppCompiler:
                     merged[-1] += (" " if not merged[-1].endswith(" ") else "") + stripped
                 else:
                     merged.append(stmt)
+            elif stripped.startswith("while") and merged and merged[-1].lstrip().startswith("do"):
+                merged[-1] += (" " if not merged[-1].endswith(" ") else "") + stripped
             else:
                 merged.append(stmt)
         return merged
@@ -5191,6 +5216,10 @@ class CppCompiler:
         stmt = stmt.strip()
         if not stmt:
             return [], False
+        # ++i, i++, --i, i-- as standalone statements
+        incdec_code = self._compile_incdec_statement(stmt)
+        if incdec_code is not None:
+            return incdec_code, False
         if stmt.startswith("printf"):
             return self._translate_printf(stmt), False
         if stmt.startswith("return"):
@@ -5199,10 +5228,44 @@ class CppCompiler:
             return self._translate_if(stmt), False
         if stmt.startswith("while"):
             return self._translate_while(stmt), False
-        if stmt.startswith("int ") or stmt.startswith("const int"):
+        if re.match(r'(?:const\s+)?(?:int|float|bool|char)\s+', stmt):
             return self._compile_declaration(stmt), False
-        if "=" in stmt and stmt.split("=")[0].strip().isidentifier():
+        # Compound assignments like a += b, a <<= 1, etc.
+        m_comp = re.match(r'^([A-Za-z_]\w*)\s*(\+=|-=|\*=|/=|&=|\|=|\^=|<<=|>>=)\s*(.+)$', stmt.rstrip(';').strip())
+        if m_comp:
+            return self._compile_compound_assignment(m_comp), False
+        if "=" in stmt and stmt.split("=", 1)[0].strip().isidentifier():
             return self._compile_assignment(stmt), False
+        if re.fullmatch(r"break\s*;?", stmt):
+            return self._translate_break(), False
+        if re.fullmatch(r"continue\s*;?", stmt):
+            return self._translate_continue(), False
+        if re.match(r"for\b", stmt):
+            return self._translate_for(stmt), False
+        if re.match(r"do\b", stmt):
+            return self._translate_do_while(stmt), False
+        # bare function call like foo() or foo(a,b)
+        mcall = re.fullmatch(r"([A-Za-z_]\w*)\s*\((.*)\)\s*", stmt)
+        if mcall:
+            name = mcall.group(1)
+            args_str = mcall.group(2).strip()
+            lines: List[str] = []
+            args = [a for a in self._split_arguments(args_str)] if args_str else []
+            # push args right-to-left
+            for arg in reversed([a for a in args if a]):
+                node = self._parse_expression_node(arg)
+                treg = self._acquire_temp_register()
+                lines.extend(self._emit_expression_to_register(node, treg))
+                lines.append(f"    PUSH {treg}")
+                self._release_temp_register(treg)
+            if name in self.var_registers:
+                reg = self._require_variable(name)
+                lines.append(f"    CALLR {reg}")
+            else:
+                lines.append(f"    CALL {name}")
+            if args:
+                lines.append(f"    ADDI R14, {len(args)*4}")
+            return lines, False
         self.warnings.append(f"Unsupported statement ignored: {stmt}")
         return [], False
 
@@ -5221,7 +5284,12 @@ class CppCompiler:
             if not remainder.startswith(","):
                 raise CppCompilerError("printf arguments must be separated by commas")
             extra_args = self._split_arguments(remainder[1:].strip())
-            values = [self._evaluate_expression(arg) for arg in extra_args if arg]
+            try:
+                values = [self._evaluate_expression(arg) for arg in extra_args if arg]
+            except CppCompilerError:
+                # Dynamic printf arguments are not evaluated at compile time; print literal only.
+                self.warnings.append("printf with non-constant arguments prints literal only (no %d substitution)")
+                values = []
             for value in values:
                 if "%d" in text_value:
                     text_value = text_value.replace("%d", str(value), 1)
@@ -5306,16 +5374,20 @@ class CppCompiler:
         remainder = remainder.strip()
         if not remainder:
             raise CppCompilerError("while statement missing body")
-        if remainder.startswith("{"):
-            body_text, tail = self._extract_block(remainder)
-            if tail.strip():
-                self.warnings.append(f"Ignoring tokens after while block: {tail.strip()}")
-            body_code = self._compile_block(body_text)
-        else:
-            body_code, _ = self._translate_statement(remainder)
         start_label = self._new_label("while_begin")
         end_label = self._new_label("while_end")
         cond_code, false_jump = self._emit_condition_code(condition)
+        self.loop_stack.append({"break": end_label, "continue": start_label})
+        try:
+            if remainder.startswith("{"):
+                body_text, tail = self._extract_block(remainder)
+                if tail.strip():
+                    self.warnings.append(f"Ignoring tokens after while block: {tail.strip()}")
+                body_code = self._compile_block(body_text)
+            else:
+                body_code, _ = self._translate_statement(remainder)
+        finally:
+            self.loop_stack.pop()
         lines = [f"{start_label}:"]
         lines.extend(cond_code)
         lines.append(f"    {false_jump} {end_label}")
@@ -5323,6 +5395,102 @@ class CppCompiler:
         lines.append(f"    JMP {start_label}")
         lines.append(f"{end_label}:")
         return lines
+
+    def _translate_for(self, stmt: str) -> List[str]:
+        header, remainder = self._extract_parenthesized(stmt)
+        header = header.strip()
+        parts: List[str] = []
+        current: List[str] = []
+        depth = 0
+        for ch in header:
+            if ch == '(':
+                depth += 1
+            elif ch == ')':
+                if depth > 0:
+                    depth -= 1
+            if ch == ';' and depth == 0:
+                parts.append("".join(current).strip())
+                current = []
+            else:
+                current.append(ch)
+        if current:
+            parts.append("".join(current).strip())
+        if len(parts) != 3:
+            raise CppCompilerError("for loop header must be 'init; condition; increment'")
+        init_src, cond_src, post_src = parts
+        remainder = remainder.strip()
+        if not remainder:
+            raise CppCompilerError("for statement missing body")
+        lines: List[str] = []
+        if init_src:
+            init_code, _ = self._translate_statement(init_src)
+            lines.extend(init_code)
+        cond_label = self._new_label("for_cond")
+        end_label = self._new_label("for_end")
+        post_label = self._new_label("for_post")
+        lines.append(f"{cond_label}:")
+        if cond_src:
+            cond_code, false_jump = self._emit_condition_code(cond_src)
+            lines.extend(cond_code)
+            lines.append(f"    {false_jump} {end_label}")
+        self.loop_stack.append({"break": end_label, "continue": post_label})
+        try:
+            if remainder.startswith("{"):
+                body_text, tail = self._extract_block(remainder)
+                if tail.strip():
+                    self.warnings.append(f"Ignoring tokens after for block: {tail.strip()}")
+                body_code = self._compile_block(body_text)
+            else:
+                body_code, _ = self._translate_statement(remainder)
+        finally:
+            self.loop_stack.pop()
+        lines.extend(body_code)
+        lines.append(f"{post_label}:")
+        if post_src:
+            post_code, _ = self._translate_statement(post_src)
+            lines.extend(post_code)
+        lines.append(f"    JMP {cond_label}")
+        lines.append(f"{end_label}:")
+        return lines
+
+    def _translate_do_while(self, stmt: str) -> List[str]:
+        remainder = stmt[len("do"):].strip()
+        if not remainder.startswith("{"):
+            raise CppCompilerError("do-while requires a block body")
+        body_text, tail = self._extract_block(remainder)
+        tail = tail.strip()
+        if not tail.startswith("while"):
+            raise CppCompilerError("do-while missing while(condition)")
+        condition, after = self._extract_parenthesized(tail)
+        start_label = self._new_label("do_begin")
+        cond_label = self._new_label("do_cond")
+        end_label = self._new_label("do_end")
+        lines: List[str] = [f"{start_label}:"]
+        self.loop_stack.append({"break": end_label, "continue": cond_label})
+        try:
+            body_code = self._compile_block(body_text)
+        finally:
+            self.loop_stack.pop()
+        lines.extend(body_code)
+        lines.append(f"{cond_label}:")
+        cond_code, false_jump = self._emit_condition_code(condition)
+        lines.extend(cond_code)
+        lines.append(f"    {false_jump} {end_label}")
+        lines.append(f"    JMP {start_label}")
+        lines.append(f"{end_label}:")
+        return lines
+
+    def _translate_break(self) -> List[str]:
+        if not self.loop_stack:
+            raise CppCompilerError("break statement not within loop")
+        target = self.loop_stack[-1]["break"]
+        return [f"    JMP {target}"]
+
+    def _translate_continue(self) -> List[str]:
+        if not self.loop_stack:
+            raise CppCompilerError("continue statement not within loop")
+        target = self.loop_stack[-1]["continue"]
+        return [f"    JMP {target}"]
 
     def _compile_block(self, block_text: str) -> List[str]:
         lines: List[str] = []
@@ -5472,32 +5640,55 @@ class CppCompiler:
         return args
 
     def _parse_expression_node(self, expr: str):
+        expr = self._normalize_expression(expr)
         try:
             return ast.parse(expr, mode="eval").body
         except SyntaxError as exc:
             raise CppCompilerError(f"Invalid expression '{expr}': {exc}")
 
+    def _normalize_expression(self, expr: str) -> str:
+        expr = expr.replace('&&', ' and ')
+        expr = expr.replace('||', ' or ')
+        expr = re.sub(r'!(?!=)', ' not ', expr)
+        expr = re.sub(r'\btrue\b', 'True', expr)
+        expr = re.sub(r'\bfalse\b', 'False', expr)
+        return expr
+
     def _compile_declaration(self, stmt: str) -> List[str]:
-        stmt = stmt.rstrip(";")
-        match = re.match(r'(const\s+)?int\s+([A-Za-z_]\w*)(\s*=\s*(.+))?$', stmt)
+        stmt = stmt.rstrip(";").strip()
+        # Ignore zero-arg function prototypes like "int foo()"; not variable declarations
+        if re.fullmatch(r"(?:const\s+)?(?:int|float|bool|char)\s+[A-Za-z_]\w*\s*\(\s*\)", stmt):
+            return []
+
+        match = re.match(r'(const\s+)?(int|float|bool|char)\s+([A-Za-z_]\w*)(\s*=\s*(.+))?$', stmt)
         if not match:
             raise CppCompilerError(f"Invalid declaration: {stmt}")
+
         is_const = bool(match.group(1))
-        name = match.group(2)
-        init_expr = match.group(4)
+        typename = match.group(2)
+        name = match.group(3)
+        init_expr = match.group(5)
+
         if name in self.var_registers:
             raise CppCompilerError(f"Variable '{name}' already declared")
+
         reg = self._allocate_var_register(name)
         code: List[str] = []
+
         if init_expr:
-            node = self._parse_expression_node(init_expr.strip())
+            expr = init_expr.strip()
+            node = self._parse_expression_node(expr)
             code.extend(self._emit_expression_to_register(node, reg))
-            self.variables[name] = self._evaluate_expression(init_expr.strip())
+            try:
+                self.variables[name] = self._evaluate_expression(expr)
+            except CppCompilerError:
+                pass
         else:
             if is_const:
-                raise CppCompilerError(f"const int {name} requires initialization")
+                raise CppCompilerError(f"const {typename} {name} requires initialization")
             code.append(f"    LOADI {reg}, 0")
             self.variables[name] = 0
+
         if is_const:
             self.const_variables.add(name)
         return code
@@ -5514,8 +5705,101 @@ class CppCompiler:
         reg = self._require_variable(name)
         node = self._parse_expression_node(expr)
         code = self._emit_expression_to_register(node, reg)
-        self.variables[name] = self._evaluate_expression(expr)
+        # Track constant value if RHS is compile-time evaluable, but do not error if not.
+        try:
+            self.variables[name] = self._evaluate_expression(expr)
+        except CppCompilerError:
+            pass
         return code
+
+    def _compile_compound_assignment(self, match: re.Match) -> List[str]:
+        name = match.group(1)
+        op = match.group(2)
+        expr = match.group(3).strip()
+        if name in self.const_variables:
+            raise CppCompilerError(f"Cannot assign to const variable '{name}'")
+        reg = self._require_variable(name)
+        node = self._parse_expression_node(expr)
+        code: List[str] = []
+        # Evaluate RHS into a temporary register
+        treg = self._acquire_temp_register()
+        try:
+            code.extend(self._emit_expression_to_register(node, treg))
+            if op == "+=":
+                code.append(f"    ADD {reg}, {treg}")
+            elif op == "-=":
+                code.append(f"    SUB {reg}, {treg}")
+            elif op == "* =" or op == "*=":
+                code.append(f"    MUL {reg}, {treg}")
+            elif op == "/=":
+                code.append(f"    DIV {reg}, {treg}")
+            elif op == "&=":
+                code.append(f"    AND {reg}, {treg}")
+            elif op == "|=":
+                code.append(f"    OR {reg}, {treg}")
+            elif op == "^=":
+                code.append(f"    XOR {reg}, {treg}")
+            elif op == "<<=":
+                code.append(f"    SHL {reg}, {treg}")
+            elif op == ">> =" or op == ">>=":
+                code.append(f"    SHR {reg}, {treg}")
+            else:
+                raise CppCompilerError(f"Unsupported compound assignment operator '{op}'")
+        finally:
+            self._release_temp_register(treg)
+        # Best-effort constant tracking
+        try:
+            if name in self.variables:
+                base = self.variables[name]
+                rhs = self._evaluate_expression(expr)
+                if op == "+=":
+                    self.variables[name] = base + rhs
+                elif op == "-=":
+                    self.variables[name] = base - rhs
+                elif op == "* =" or op == "*=":
+                    self.variables[name] = base * rhs
+                elif op == "/=":
+                    if rhs != 0:
+                        self.variables[name] = base // rhs
+                elif op == "&=":
+                    self.variables[name] = base & rhs
+                elif op == "|=":
+                    self.variables[name] = base | rhs
+                elif op == "^=":
+                    self.variables[name] = base ^ rhs
+                elif op == "<<=":
+                    self.variables[name] = base << rhs
+                elif op == ">> =" or op == ">>=" and rhs >= 0:
+                    self.variables[name] = base >> rhs
+        except CppCompilerError:
+            pass
+        return code
+
+    def _compile_incdec_statement(self, stmt: str) -> Optional[List[str]]:
+        """Handle ++i, i++, --i, i-- as standalone statements.
+
+        Expression-level ++/-- (e.g., x = y++) are not supported; this only
+        compiles increment/decrement when they appear as full statements.
+        """
+        core = stmt.rstrip(";").strip()
+        name: Optional[str] = None
+        delta = 0
+        m = re.fullmatch(r"([A-Za-z_]\w*)\s*(\+\+|--)", core)
+        if m:
+            name = m.group(1)
+            delta = 1 if m.group(2) == "++" else -1
+        else:
+            m2 = re.fullmatch(r"(\+\+|--)\s*([A-Za-z_]\w*)", core)
+            if m2:
+                delta = 1 if m2.group(1) == "++" else -1
+                name = m2.group(2)
+        if name is None:
+            return None
+        if name in self.const_variables:
+            raise CppCompilerError(f"Cannot modify const variable '{name}' with ++/--")
+        reg = self._require_variable(name)
+        # Use ADDI with small immediate; fits 16-bit range easily.
+        return [f"    ADDI {reg}, {delta}"]
 
     def _allocate_var_register(self, name: str) -> str:
         if not self.var_register_pool:
@@ -5548,6 +5832,18 @@ class CppCompiler:
         if const_val is not None:
             code.extend(self._emit_load_immediate(target, const_val))
             return code
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+            code.extend(self._emit_expression_to_register(node.operand, target))
+            lbl_true = self._new_label("not_is_zero")
+            lbl_done = self._new_label("not_done")
+            code.append(f"    CMP {target}, 0")
+            code.append(f"    JE {lbl_true}")
+            code.append(f"    LOADI {target}, 0")
+            code.append(f"    JMP {lbl_done}")
+            code.append(f"{lbl_true}:")
+            code.append(f"    LOADI {target}, 1")
+            code.append(f"{lbl_done}:")
+            return code
         if isinstance(node, ast.UnaryOp):
             code.extend(self._emit_expression_to_register(node.operand, target))
             if isinstance(node.op, ast.USub):
@@ -5562,6 +5858,192 @@ class CppCompiler:
             if src != target:
                 code.append(f"    MOV {target}, {src}")
             return code
+        if isinstance(node, ast.Compare):
+            if len(node.ops) != 1 or len(node.comparators) != 1:
+                raise CppCompilerError("Chained comparisons not supported")
+            left = node.left
+            right = node.comparators[0]
+            op = node.ops[0]
+            code.extend(self._emit_expression_to_register(left, target))
+            rhs_code, rhs_reg, should_release = self._load_operand(right)
+            code.extend(rhs_code)
+            code.append(f"    CMP {target}, {rhs_reg}")
+            lbl_true = self._new_label("cmp_true")
+            lbl_done = self._new_label("cmp_done")
+            code.append(f"    LOADI {target}, 0")
+            if isinstance(op, ast.Eq):
+                jmp_true = "JE"
+            elif isinstance(op, ast.NotEq):
+                jmp_true = "JNE"
+            elif isinstance(op, ast.Gt):
+                jmp_true = "JG"
+            elif isinstance(op, ast.GtE):
+                jmp_true = "JGE"
+            elif isinstance(op, ast.Lt):
+                jmp_true = "JL"
+            elif isinstance(op, ast.LtE):
+                jmp_true = "JLE"
+            else:
+                raise CppCompilerError("Unsupported comparison operator")
+            code.append(f"    {jmp_true} {lbl_true}")
+            code.append(f"    JMP {lbl_done}")
+            code.append(f"{lbl_true}:")
+            code.append(f"    LOADI {target}, 1")
+            code.append(f"{lbl_done}:")
+            if should_release:
+                self._release_temp_register(rhs_reg)
+            return code
+        if isinstance(node, ast.BoolOp):
+            if not isinstance(node.op, (ast.And, ast.Or)):
+                raise CppCompilerError("Unsupported boolean operator")
+            code.extend(self._emit_expression_to_register(node.values[0], target))
+            code.extend(self._emit_coerce_to_bool(target))
+            if isinstance(node.op, ast.And):
+                lbl_done = self._new_label("and_done")
+                code.append(f"    CMP {target}, 0")
+                code.append(f"    JE {lbl_done}")
+                for rhs in node.values[1:]:
+                    treg = self._acquire_temp_register()
+                    code.extend(self._emit_expression_to_register(rhs, treg))
+                    code.append(f"    MOV {target}, {treg}")
+                    self._release_temp_register(treg)
+                    code.extend(self._emit_coerce_to_bool(target))
+                code.append(f"{lbl_done}:")
+                return code
+            else:
+                lbl_done = self._new_label("or_done")
+                code.append(f"    CMP {target}, 0")
+                code.append(f"    JNE {lbl_done}")
+                for rhs in node.values[1:]:
+                    treg = self._acquire_temp_register()
+                    code.extend(self._emit_expression_to_register(rhs, treg))
+                    code.append(f"    MOV {target}, {treg}")
+                    self._release_temp_register(treg)
+                    code.extend(self._emit_coerce_to_bool(target))
+                code.append(f"{lbl_done}:")
+                return code
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            fname = node.func.id
+            # Intrinsic math helpers mapped directly to CPU opcodes
+            if fname == "abs" and len(node.args) == 1:
+                # abs(x) -> ABS target, target
+                code.extend(self._emit_expression_to_register(node.args[0], target))
+                code.append(f"    ABS {target}, {target}")
+                return code
+            if fname in ("min", "max") and len(node.args) == 2:
+                # min(a,b) / max(a,b) -> MIN/MAX target, rhs_reg
+                code.extend(self._emit_expression_to_register(node.args[0], target))
+                rhs_code, rhs_reg, should_release = self._load_operand(node.args[1])
+                code.extend(rhs_code)
+                op = "MIN" if fname == "min" else "MAX"
+                code.append(f"    {op} {target}, {rhs_reg}")
+                if should_release:
+                    self._release_temp_register(rhs_reg)
+                return code
+            if fname == "sqrt" and len(node.args) == 1:
+                # sqrt(x) -> SQRT target, target
+                code.extend(self._emit_expression_to_register(node.args[0], target))
+                code.append(f"    SQRT {target}, {target}")
+                return code
+            if fname == "pow" and len(node.args) == 2:
+                # pow(a,b) -> POW target, rhs_reg
+                code.extend(self._emit_expression_to_register(node.args[0], target))
+                rhs_code, rhs_reg, should_release = self._load_operand(node.args[1])
+                code.extend(rhs_code)
+                code.append(f"    POW {target}, {rhs_reg}")
+                if should_release:
+                    self._release_temp_register(rhs_reg)
+                return code
+            if fname == "log" and len(node.args) == 1:
+                # log(x) -> LOG target, target
+                code.extend(self._emit_expression_to_register(node.args[0], target))
+                code.append(f"    LOG {target}, {target}")
+                return code
+            if fname == "exp" and len(node.args) == 1:
+                # exp(x) -> EXP target, target
+                code.extend(self._emit_expression_to_register(node.args[0], target))
+                code.append(f"    EXP {target}, {target}")
+                return code
+            if fname == "sin" and len(node.args) == 1:
+                # sin(x) -> SIN target, target
+                code.extend(self._emit_expression_to_register(node.args[0], target))
+                code.append(f"    SIN {target}, {target}")
+                return code
+            if fname == "cos" and len(node.args) == 1:
+                # cos(x) -> COS target, target
+                code.extend(self._emit_expression_to_register(node.args[0], target))
+                code.append(f"    COS {target}, {target}")
+                return code
+            if fname == "tan" and len(node.args) == 1:
+                # tan(x) -> TAN target, target
+                code.extend(self._emit_expression_to_register(node.args[0], target))
+                code.append(f"    TAN {target}, {target}")
+                return code
+            # Non-math utility intrinsics
+            if fname == "rand" and len(node.args) == 0:
+                # rand() -> RANDOM target
+                code.append(f"    RANDOM {target}")
+                return code
+            if fname == "hash" and len(node.args) == 1:
+                # hash(x) -> HASH target, target
+                code.extend(self._emit_expression_to_register(node.args[0], target))
+                code.append(f"    HASH {target}, {target}")
+                return code
+            if fname == "crc32" and len(node.args) == 1:
+                # crc32(x) -> CRC32 target, target
+                code.extend(self._emit_expression_to_register(node.args[0], target))
+                code.append(f"    CRC32 {target}, {target}")
+                return code
+            if fname == "clamp" and len(node.args) == 3:
+                # clamp(x, lo, hi) implemented via MIN/MAX on registers
+                # Evaluate x into target
+                code.extend(self._emit_expression_to_register(node.args[0], target))
+                # Evaluate lo and hi into temporaries
+                lo_reg = self._acquire_temp_register()
+                code.extend(self._emit_expression_to_register(node.args[1], lo_reg))
+                hi_reg = self._acquire_temp_register()
+                code.extend(self._emit_expression_to_register(node.args[2], hi_reg))
+                # target = min(target, hi_reg)
+                code.append(f"    MIN {target}, {hi_reg}")
+                # target = max(target, lo_reg)
+                code.append(f"    MAX {target}, {lo_reg}")
+                self._release_temp_register(hi_reg)
+                self._release_temp_register(lo_reg)
+                return code
+            # Bit helper intrinsics
+            if fname == "popcount" and len(node.args) == 1:
+                # popcount(x) -> POPCOUNT target, target
+                code.extend(self._emit_expression_to_register(node.args[0], target))
+                code.append(f"    POPCOUNT {target}, {target}")
+                return code
+            if fname == "lzcnt" and len(node.args) == 1:
+                # lzcnt(x) -> LZCNT target, target
+                code.extend(self._emit_expression_to_register(node.args[0], target))
+                code.append(f"    LZCNT {target}, {target}")
+                return code
+            if fname == "tzcnt" and len(node.args) == 1:
+                # tzcnt(x) -> TZCNT target, target
+                code.extend(self._emit_expression_to_register(node.args[0], target))
+                code.append(f"    TZCNT {target}, {target}")
+                return code
+
+            # Regular function calls
+            if node.args:
+                for arg in reversed(node.args):
+                    treg = self._acquire_temp_register()
+                    code.extend(self._emit_expression_to_register(arg, treg))
+                    code.append(f"    PUSH {treg}")
+                    self._release_temp_register(treg)
+            if fname in self.var_registers:
+                reg = self._require_variable(fname)
+                code.append(f"    CALLR {reg}")
+            else:
+                code.append(f"    CALL {fname}")
+            if node.args:
+                code.append(f"    ADDI R14, {len(node.args)*4}")
+            if target != "R0":
+                code.append(f"    MOV {target}, R0")
+            return code
         if isinstance(node, ast.BinOp):
             code.extend(self._emit_expression_to_register(node.left, target))
             rhs_code, rhs_reg, should_release = self._load_operand(node.right)
@@ -5571,6 +6053,21 @@ class CppCompiler:
                 self._release_temp_register(rhs_reg)
             return code
         raise CppCompilerError("Unsupported expression construct")
+
+    def _emit_coerce_to_bool(self, reg: str) -> List[str]:
+        lines: List[str] = []
+        lbl_true = self._new_label("bool_true")
+        lbl_done = self._new_label("bool_done")
+        lines.append(f"    CMP {reg}, 0")
+        lines.append(f"    JE {lbl_done}")
+        lines.append(f"    LOADI {reg}, 1")
+        lines.append(f"    JMP {lbl_done}")
+        lines.append(f"{lbl_done}:")
+        lines.append(f"    CMP {reg}, 0")
+        lines.append(f"    JNE {lbl_true}")
+        lines.append(f"    LOADI {reg}, 0")
+        lines.append(f"{lbl_true}:")
+        return lines
 
     def _load_operand(self, node) -> Tuple[List[str], str, bool]:
         if isinstance(node, ast.Name):
@@ -5594,6 +6091,16 @@ class CppCompiler:
             return [f"    DIV {target}, {rhs_reg}"]
         if isinstance(op, ast.Mod):
             return [f"    MOD {target}, {rhs_reg}"]
+        if isinstance(op, ast.BitAnd):
+            return [f"    AND {target}, {rhs_reg}"]
+        if isinstance(op, ast.BitOr):
+            return [f"    OR {target}, {rhs_reg}"]
+        if isinstance(op, ast.BitXor):
+            return [f"    XOR {target}, {rhs_reg}"]
+        if isinstance(op, ast.LShift):
+            return [f"    SHL {target}, {rhs_reg}"]
+        if isinstance(op, ast.RShift):
+            return [f"    SHR {target}, {rhs_reg}"]
         raise CppCompilerError("Unsupported binary operator")
 
     def _try_constant_value(self, node) -> Optional[int]:
@@ -5606,6 +6113,11 @@ class CppCompiler:
             if inner is None:
                 return None
             return inner if isinstance(node.op, ast.UAdd) else -inner
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Invert):
+            inner = self._try_constant_value(node.operand)
+            if inner is None:
+                return None
+            return ~inner
         if isinstance(node, ast.BinOp):
             left = self._try_constant_value(node.left)
             right = self._try_constant_value(node.right)
@@ -5625,9 +6137,24 @@ class CppCompiler:
                 if right == 0:
                     return None
                 return left % right
+            if isinstance(node.op, ast.BitAnd):
+                return left & right
+            if isinstance(node.op, ast.BitOr):
+                return left | right
+            if isinstance(node.op, ast.BitXor):
+                return left ^ right
+            if isinstance(node.op, ast.LShift):
+                if right < 0:
+                    return None
+                return left << right
+            if isinstance(node.op, ast.RShift):
+                if right < 0:
+                    return None
+                return left >> right
         return None
 
     def _evaluate_expression(self, expr: str) -> int:
+        expr = self._normalize_expression(expr)
         try:
             tree = ast.parse(expr, mode="eval")
         except SyntaxError as exc:
@@ -5642,7 +6169,10 @@ class CppCompiler:
         if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
             val = self._eval_node(node.operand)
             return val if isinstance(node.op, ast.UAdd) else -val
-        if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Sub, ast.Mult, ast.FloorDiv, ast.Div, ast.Mod)):
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Invert):
+            val = self._eval_node(node.operand)
+            return ~val
+        if isinstance(node, ast.BinOp):
             left = self._eval_node(node.left)
             right = self._eval_node(node.right)
             if isinstance(node.op, ast.Add):
@@ -5659,6 +6189,20 @@ class CppCompiler:
                 if right == 0:
                     raise CppCompilerError("Modulo by zero in expression")
                 return left % right
+            if isinstance(node.op, ast.BitAnd):
+                return left & right
+            if isinstance(node.op, ast.BitOr):
+                return left | right
+            if isinstance(node.op, ast.BitXor):
+                return left ^ right
+            if isinstance(node.op, ast.LShift):
+                if right < 0:
+                    raise CppCompilerError("Negative shift count")
+                return left << right
+            if isinstance(node.op, ast.RShift):
+                if right < 0:
+                    raise CppCompilerError("Negative shift count")
+                return left >> right
         if isinstance(node, ast.Name):
             if node.id not in self.variables:
                 raise CppCompilerError(f"Unknown identifier '{node.id}'")
@@ -6498,7 +7042,11 @@ class Shell:
                 traceback.print_exc()
         
         # Show key register values after execution
-        print(f"Key registers: R0={self.cpu.reg_read(0)}, R1={self.cpu.reg_read(1)}, R2={self.cpu.reg_read(2)}")
+        r0 = self.cpu.reg_read(0)
+        r1 = self.cpu.reg_read(1)
+        r2 = self.cpu.reg_read(2)
+        print(f"Key registers: R0={r0}, R1={r1}, R2={r2}")
+        print(f"Program exit code (R0): {r0}")
         
         # Show output mode results
         if output_mode or debug_mode:
