@@ -413,6 +413,15 @@ OP_DIVI = 0x154
 OP_LERP = 0x9E    # Linear interpolation: lerp(a, b, t)
 OP_SIGN = 0x9F    # Sign of number: -1, 0, or 1
 OP_SATURATE = 0xA0  # Clamp to 0-255 range (useful for colors)
+# Graphics opcodes (0xA1-0xA8)
+OP_PIXEL = 0xA1      # Draw pixel: PIXEL x, y, color
+OP_LINE = 0xA2       # Draw line: LINE x1, y1, x2, y2, color
+OP_RECT = 0xA3       # Draw rectangle outline: RECT x, y, w, h, color
+OP_FILLRECT = 0xA4   # Draw filled rectangle: FILLRECT x, y, w, h, color
+OP_CIRCLE = 0xA5     # Draw circle outline: CIRCLE x, y, r, color
+OP_FILLCIRCLE = 0xA6 # Draw filled circle: FILLCIRCLE x, y, r, color
+OP_GETPIXEL = 0xA7   # Get pixel color: GETPIXEL dst, x, y
+OP_CLEAR = 0xA8      # Clear screen: CLEAR color
 
 OPCODE_NAME = {
     OP_NOP: "NOP", OP_MOV: "MOV", OP_LOADI: "LOADI", OP_LOAD: "LOAD", OP_STORE: "STORE",
@@ -463,6 +472,8 @@ OPCODE_NAME = {
     OP_ADDI: "ADDI", OP_SUBI: "SUBI", OP_MULI: "MULI", OP_DIVI: "DIVI",
     OP_ANDI: "ANDI", OP_ORI: "ORI", OP_XORI: "XORI", OP_SHLI: "SHLI", OP_SHRI: "SHRI",
     OP_LERP: "LERP", OP_SIGN: "SIGN", OP_SATURATE: "SATURATE",
+    OP_PIXEL: "PIXEL", OP_LINE: "LINE", OP_RECT: "RECT", OP_FILLRECT: "FILLRECT",
+    OP_CIRCLE: "CIRCLE", OP_FILLCIRCLE: "FILLCIRCLE", OP_GETPIXEL: "GETPIXEL", OP_CLEAR: "CLEAR",
     OP_SETG: "SETG", OP_SETLE: "SETLE", OP_SETGE: "SETGE", OP_SETNE: "SETNE", OP_SETE: "SETE",
     OP_LOOP: "LOOP", OP_LOOPZ: "LOOPZ", OP_LOOPNZ: "LOOPNZ",
     OP_REP: "REP", OP_REPZ: "REPZ", OP_REPNZ: "REPNZ",
@@ -861,6 +872,11 @@ class Memory:
         self.access_log = []
         self.max_log_size = 1000
         
+        # Graphics framebuffer (320x200 pixels, 32-bit RGBA)
+        self.fb_width = 320
+        self.fb_height = 200
+        self.framebuffer = bytearray(self.fb_width * self.fb_height * 4)  # RGBA
+        
         # Initialize default memory regions
         self._init_default_regions()
         logger.debug("Memory initialized: %d bytes (%d pages)", 
@@ -1251,6 +1267,101 @@ class Memory:
         for offset in range(length):
             self.write_byte((addr + offset) & 0xFFFFFFFF, 0)
         self.memory_stats['scrub_operations'] += 1
+    
+    # Graphics methods
+    def set_pixel(self, x: int, y: int, color: int):
+        """Set a pixel in the framebuffer (color is 32-bit RGBA)"""
+        if 0 <= x < self.fb_width and 0 <= y < self.fb_height:
+            offset = (y * self.fb_width + x) * 4
+            # Store as RGBA
+            self.framebuffer[offset] = (color >> 16) & 0xFF  # R
+            self.framebuffer[offset + 1] = (color >> 8) & 0xFF  # G
+            self.framebuffer[offset + 2] = color & 0xFF  # B
+            self.framebuffer[offset + 3] = (color >> 24) & 0xFF  # A
+    
+    def get_pixel(self, x: int, y: int) -> int:
+        """Get a pixel from the framebuffer"""
+        if 0 <= x < self.fb_width and 0 <= y < self.fb_height:
+            offset = (y * self.fb_width + x) * 4
+            r = self.framebuffer[offset]
+            g = self.framebuffer[offset + 1]
+            b = self.framebuffer[offset + 2]
+            a = self.framebuffer[offset + 3]
+            return (a << 24) | (r << 16) | (g << 8) | b
+        return 0
+    
+    def clear_screen(self, color: int):
+        """Clear the entire screen to a color"""
+        for y in range(self.fb_height):
+            for x in range(self.fb_width):
+                self.set_pixel(x, y, color)
+    
+    def draw_line(self, x1: int, y1: int, x2: int, y2: int, color: int):
+        """Draw a line using Bresenham's algorithm"""
+        dx = abs(x2 - x1)
+        dy = abs(y2 - y1)
+        sx = 1 if x1 < x2 else -1
+        sy = 1 if y1 < y2 else -1
+        err = dx - dy
+        
+        while True:
+            self.set_pixel(x1, y1, color)
+            if x1 == x2 and y1 == y2:
+                break
+            e2 = 2 * err
+            if e2 > -dy:
+                err -= dy
+                x1 += sx
+            if e2 < dx:
+                err += dx
+                y1 += sy
+    
+    def draw_rect(self, x: int, y: int, w: int, h: int, color: int):
+        """Draw a rectangle outline"""
+        # Top and bottom
+        for i in range(w):
+            self.set_pixel(x + i, y, color)
+            self.set_pixel(x + i, y + h - 1, color)
+        # Left and right
+        for i in range(h):
+            self.set_pixel(x, y + i, color)
+            self.set_pixel(x + w - 1, y + i, color)
+    
+    def fill_rect(self, x: int, y: int, w: int, h: int, color: int):
+        """Draw a filled rectangle"""
+        for j in range(h):
+            for i in range(w):
+                self.set_pixel(x + i, y + j, color)
+    
+    def draw_circle(self, cx: int, cy: int, r: int, color: int):
+        """Draw a circle outline using midpoint algorithm"""
+        x = r
+        y = 0
+        err = 0
+        
+        while x >= y:
+            self.set_pixel(cx + x, cy + y, color)
+            self.set_pixel(cx + y, cy + x, color)
+            self.set_pixel(cx - y, cy + x, color)
+            self.set_pixel(cx - x, cy + y, color)
+            self.set_pixel(cx - x, cy - y, color)
+            self.set_pixel(cx - y, cy - x, color)
+            self.set_pixel(cx + y, cy - x, color)
+            self.set_pixel(cx + x, cy - y, color)
+            
+            if err <= 0:
+                y += 1
+                err += 2 * y + 1
+            if err > 0:
+                x -= 1
+                err -= 2 * x + 1
+    
+    def fill_circle(self, cx: int, cy: int, r: int, color: int):
+        """Draw a filled circle"""
+        for y in range(-r, r + 1):
+            for x in range(-r, r + 1):
+                if x * x + y * y <= r * r:
+                    self.set_pixel(cx + x, cy + y, color)
 
 # ---------------------------
 # Process Management
@@ -4042,6 +4153,61 @@ class CPU:
             else:
                 result = val
             self.reg_write(dst, result)
+        # Graphics opcodes
+        elif opcode == OP_PIXEL:
+            # PIXEL: Draw pixel at (R0, R1) with color R2
+            x = self.reg_read(0)
+            y = self.reg_read(1)
+            color = self.reg_read(2)
+            self.mem.set_pixel(x, y, color)
+        elif opcode == OP_LINE:
+            # LINE: Draw line from (R0, R1) to (R2, R3) with color in dst
+            x1 = self.reg_read(0)
+            y1 = self.reg_read(1)
+            x2 = self.reg_read(2)
+            y2 = self.reg_read(3)
+            color = self.reg_read(dst)
+            self.mem.draw_line(x1, y1, x2, y2, color)
+        elif opcode == OP_RECT:
+            # RECT: Draw rectangle at (R0, R1) with size (R2, R3) and color in dst
+            x = self.reg_read(0)
+            y = self.reg_read(1)
+            w = self.reg_read(2)
+            h = self.reg_read(3)
+            color = self.reg_read(dst)
+            self.mem.draw_rect(x, y, w, h, color)
+        elif opcode == OP_FILLRECT:
+            # FILLRECT: Draw filled rectangle at (R0, R1) with size (R2, R3) and color in dst
+            x = self.reg_read(0)
+            y = self.reg_read(1)
+            w = self.reg_read(2)
+            h = self.reg_read(3)
+            color = self.reg_read(dst)
+            self.mem.fill_rect(x, y, w, h, color)
+        elif opcode == OP_CIRCLE:
+            # CIRCLE: Draw circle at (R0, R1) with radius R2 and color in dst
+            cx = self.reg_read(0)
+            cy = self.reg_read(1)
+            r = self.reg_read(2)
+            color = self.reg_read(dst)
+            self.mem.draw_circle(cx, cy, r, color)
+        elif opcode == OP_FILLCIRCLE:
+            # FILLCIRCLE: Draw filled circle at (R0, R1) with radius R2 and color in dst
+            cx = self.reg_read(0)
+            cy = self.reg_read(1)
+            r = self.reg_read(2)
+            color = self.reg_read(dst)
+            self.mem.fill_circle(cx, cy, r, color)
+        elif opcode == OP_GETPIXEL:
+            # GETPIXEL: Get pixel color at (R1, R2) and store in dst
+            x = self.reg_read(1)
+            y = self.reg_read(2)
+            color = self.mem.get_pixel(x, y)
+            self.reg_write(dst, color)
+        elif opcode == OP_CLEAR:
+            # CLEAR: Clear screen with color in dst
+            color = self.reg_read(dst)
+            self.mem.clear_screen(color)
         elif opcode == OP_LOOP:
             # LOOP: Decrement RCX and jump if not zero
             rcx = self.reg_read(1)  # Assume R1 is the counter
@@ -4916,7 +5082,7 @@ class Assembler:
                 word = 0
                 if opcode in (OP_NOP, OP_NOP2, OP_NOP3, OP_NOP4, OP_RET, OP_HALT, OP_CLC, OP_STC, OP_CLI, OP_STI, OP_IRET, OP_LEAVE, OP_FLDZ, OP_FLD1, OP_FLDPI, OP_FLDLG2, OP_FLDLN2, OP_FCLEX, OP_NEG, OP_CBW, OP_CWD, OP_CWDQ, OP_CLD, OP_STD, OP_LAHF, OP_SAHF, OP_INTO, OP_AAM, OP_AAD, OP_XLAT, OP_XCHG, OP_CMPXCHG, OP_LAR, OP_LSL, OP_SLDT, OP_STR, OP_LLDT, OP_LTR, OP_VERR, OP_VERW, OP_SGDT, OP_SIDT, OP_LGDT, OP_LIDT, OP_SMSW, OP_LMSW, OP_CLTS, OP_INVD, OP_WBINVD, OP_INVLPG, OP_INVPCID, OP_VMCALL, OP_VMLAUNCH, OP_VMRESUME, OP_VMXOFF, OP_MONITOR, OP_MWAIT, OP_RDSEED, OP_RDRAND, OP_CLAC, OP_STAC, OP_SKINIT, OP_SVMEXIT, OP_SVMRET, OP_SVMLOCK, OP_SVMUNLOCK, OP_NET_CLOSE, OP_SWAP, OP_REVERSE, OP_RDTSC, OP_RDMSR, OP_WRMSR, OP_PAUSE, OP_LOCK, OP_REPNE, OP_REPE, OP_REP, OP_REPZ, OP_REPNZ, OP_MOVSB, OP_MOVSW, OP_MOVSD, OP_CMPSB, OP_SCASB, OP_LODSB, OP_STOSB):
                     word = pack_instruction(opcode, 0, 0, 0)
-                elif opcode in (OP_MOV, OP_ADD, OP_SUB, OP_AND, OP_OR, OP_XOR, OP_CMP, OP_TEST, OP_SHL, OP_SHR, OP_MUL, OP_IMUL, OP_DIV, OP_IDIV, OP_MOD, OP_FADD, OP_FSUB, OP_FMUL, OP_FDIV, OP_FCOMP, OP_FXCH, OP_ADC, OP_SBB, OP_ROL, OP_ROR, OP_BT, OP_BTS, OP_BTR, OP_BSF, OP_BSR, OP_ACCADD, OP_ACCSUB, OP_SETACC, OP_GETACC, OP_NET_SEND, OP_NET_RECV, OP_NET_CONNECT, OP_ROT, OP_HASH, OP_CRC32, OP_GETTIME, OP_SETSEED):
+                elif opcode in (OP_MOV, OP_ADD, OP_SUB, OP_AND, OP_OR, OP_XOR, OP_CMP, OP_TEST, OP_SHL, OP_SHR, OP_MUL, OP_IMUL, OP_DIV, OP_IDIV, OP_MOD, OP_FADD, OP_FSUB, OP_FMUL, OP_FDIV, OP_FCOMP, OP_FXCH, OP_ADC, OP_SBB, OP_ROL, OP_ROR, OP_BT, OP_BTS, OP_BTR, OP_BSF, OP_BSR, OP_ACCADD, OP_ACCSUB, OP_SETACC, OP_GETACC, OP_NET_SEND, OP_NET_RECV, OP_NET_CONNECT, OP_ROT, OP_HASH, OP_CRC32, OP_GETTIME, OP_SETSEED, OP_MIN, OP_MAX, OP_ABS, OP_POPCNT, OP_STRLEN, OP_STRCMP, OP_SLEEP, OP_SQRT, OP_POW, OP_LOG, OP_EXP, OP_SIN, OP_COS, OP_TAN):
                     if len(args) != 2:
                         raise AssemblerError(f"{mnem} requires two operands on line {ln}")
                     dst = self.parse_reg(args[0])
@@ -4936,6 +5102,27 @@ class Assembler:
                         raise AssemblerError(f"{mnem} requires one register operand on line {ln}")
                     dst = self.parse_reg(args[0])
                     word = pack_instruction(opcode, dst, 0, 0)
+                elif opcode in (OP_PIXEL, OP_LINE, OP_RECT, OP_FILLRECT, OP_CIRCLE, OP_FILLCIRCLE, OP_GETPIXEL, OP_CLEAR):
+                    # Graphics instructions - parameters in R0-R3, color in specified register
+                    # PIXEL: no args (uses R0=x, R1=y, R2=color)
+                    # LINE Rcolor: uses R0=x1, R1=y1, R2=x2, R3=y2, Rcolor=color
+                    # RECT Rcolor: uses R0=x, R1=y, R2=w, R3=h, Rcolor=color
+                    # FILLRECT Rcolor: uses R0=x, R1=y, R2=w, R3=h, Rcolor=color
+                    # CIRCLE Rcolor: uses R0=cx, R1=cy, R2=r, Rcolor=color
+                    # FILLCIRCLE Rcolor: uses R0=cx, R1=cy, R2=r, Rcolor=color
+                    # GETPIXEL Rdst: uses R1=x, R2=y, stores result in Rdst
+                    # CLEAR Rcolor: uses Rcolor=color
+                    if opcode == OP_PIXEL:
+                        # PIXEL takes no args, uses R0, R1, R2
+                        if len(args) != 0:
+                            raise AssemblerError(f"PIXEL takes no arguments (uses R0=x, R1=y, R2=color) on line {ln}")
+                        word = pack_instruction(opcode, 0, 0, 0)
+                    elif len(args) == 1:
+                        # Single register argument for color or destination
+                        dst = self.parse_reg(args[0])
+                        word = pack_instruction(opcode, dst, 0, 0)
+                    else:
+                        raise AssemblerError(f"{mnem} requires one register argument on line {ln}")
                 elif opcode == OP_LERP:
                     # LERP: Three operands - LERP dst, src, imm (dst=a, src=b, imm=t)
                     if len(args) != 3:
@@ -5432,6 +5619,74 @@ class CppCompiler:
                 treg = self._acquire_temp_register()
                 lines.extend(self._emit_expression_to_register(node, treg))
                 lines.append(f"    SLEEP R0, {treg}")  # Two operand form
+                self._release_temp_register(treg)
+                return lines, False
+            
+            # Graphics functions (statement form)
+            if name == "pixel" and len(args) == 3:
+                lines.extend(self._emit_expression_to_register(self._parse_expression_node(args[0]), "R0"))
+                lines.extend(self._emit_expression_to_register(self._parse_expression_node(args[1]), "R1"))
+                lines.extend(self._emit_expression_to_register(self._parse_expression_node(args[2]), "R2"))
+                lines.append(f"    PIXEL")
+                return lines, False
+            
+            if name == "line" and len(args) == 5:
+                lines.extend(self._emit_expression_to_register(self._parse_expression_node(args[0]), "R0"))
+                lines.extend(self._emit_expression_to_register(self._parse_expression_node(args[1]), "R1"))
+                lines.extend(self._emit_expression_to_register(self._parse_expression_node(args[2]), "R2"))
+                lines.extend(self._emit_expression_to_register(self._parse_expression_node(args[3]), "R3"))
+                treg = self._acquire_temp_register()
+                lines.extend(self._emit_expression_to_register(self._parse_expression_node(args[4]), treg))
+                lines.append(f"    LINE {treg}")
+                self._release_temp_register(treg)
+                return lines, False
+            
+            if name == "rect" and len(args) == 5:
+                lines.extend(self._emit_expression_to_register(self._parse_expression_node(args[0]), "R0"))
+                lines.extend(self._emit_expression_to_register(self._parse_expression_node(args[1]), "R1"))
+                lines.extend(self._emit_expression_to_register(self._parse_expression_node(args[2]), "R2"))
+                lines.extend(self._emit_expression_to_register(self._parse_expression_node(args[3]), "R3"))
+                treg = self._acquire_temp_register()
+                lines.extend(self._emit_expression_to_register(self._parse_expression_node(args[4]), treg))
+                lines.append(f"    RECT {treg}")
+                self._release_temp_register(treg)
+                return lines, False
+            
+            if name == "fillrect" and len(args) == 5:
+                lines.extend(self._emit_expression_to_register(self._parse_expression_node(args[0]), "R0"))
+                lines.extend(self._emit_expression_to_register(self._parse_expression_node(args[1]), "R1"))
+                lines.extend(self._emit_expression_to_register(self._parse_expression_node(args[2]), "R2"))
+                lines.extend(self._emit_expression_to_register(self._parse_expression_node(args[3]), "R3"))
+                treg = self._acquire_temp_register()
+                lines.extend(self._emit_expression_to_register(self._parse_expression_node(args[4]), treg))
+                lines.append(f"    FILLRECT {treg}")
+                self._release_temp_register(treg)
+                return lines, False
+            
+            if name == "circle" and len(args) == 4:
+                lines.extend(self._emit_expression_to_register(self._parse_expression_node(args[0]), "R0"))
+                lines.extend(self._emit_expression_to_register(self._parse_expression_node(args[1]), "R1"))
+                lines.extend(self._emit_expression_to_register(self._parse_expression_node(args[2]), "R2"))
+                treg = self._acquire_temp_register()
+                lines.extend(self._emit_expression_to_register(self._parse_expression_node(args[3]), treg))
+                lines.append(f"    CIRCLE {treg}")
+                self._release_temp_register(treg)
+                return lines, False
+            
+            if name == "fillcircle" and len(args) == 4:
+                lines.extend(self._emit_expression_to_register(self._parse_expression_node(args[0]), "R0"))
+                lines.extend(self._emit_expression_to_register(self._parse_expression_node(args[1]), "R1"))
+                lines.extend(self._emit_expression_to_register(self._parse_expression_node(args[2]), "R2"))
+                treg = self._acquire_temp_register()
+                lines.extend(self._emit_expression_to_register(self._parse_expression_node(args[3]), treg))
+                lines.append(f"    FILLCIRCLE {treg}")
+                self._release_temp_register(treg)
+                return lines, False
+            
+            if name == "clear" and len(args) == 1:
+                treg = self._acquire_temp_register()
+                lines.extend(self._emit_expression_to_register(self._parse_expression_node(args[0]), treg))
+                lines.append(f"    CLEAR {treg}")
                 self._release_temp_register(treg)
                 return lines, False
             
@@ -6411,6 +6666,87 @@ class CppCompiler:
                 code.append(f"    MAX {target}, {lo_reg}")
                 self._release_temp_register(hi_reg)
                 self._release_temp_register(lo_reg)
+                return code
+            # Graphics functions
+            if fname == "pixel" and len(node.args) == 3:
+                # pixel(x, y, color) -> PIXEL (uses R0=x, R1=y, R2=color)
+                code.extend(self._emit_expression_to_register(node.args[0], "R0"))
+                code.extend(self._emit_expression_to_register(node.args[1], "R1"))
+                code.extend(self._emit_expression_to_register(node.args[2], "R2"))
+                code.append(f"    PIXEL")
+                code.append(f"    LOADI {target}, 0")  # Return 0
+                return code
+            if fname == "line" and len(node.args) == 5:
+                # line(x1, y1, x2, y2, color) -> LINE
+                code.extend(self._emit_expression_to_register(node.args[0], "R0"))
+                code.extend(self._emit_expression_to_register(node.args[1], "R1"))
+                code.extend(self._emit_expression_to_register(node.args[2], "R2"))
+                code.extend(self._emit_expression_to_register(node.args[3], "R3"))
+                color_reg = self._acquire_temp_register()
+                code.extend(self._emit_expression_to_register(node.args[4], color_reg))
+                code.append(f"    LINE {color_reg}")
+                self._release_temp_register(color_reg)
+                code.append(f"    LOADI {target}, 0")  # Return 0
+                return code
+            if fname == "rect" and len(node.args) == 5:
+                # rect(x, y, w, h, color) -> RECT
+                code.extend(self._emit_expression_to_register(node.args[0], "R0"))
+                code.extend(self._emit_expression_to_register(node.args[1], "R1"))
+                code.extend(self._emit_expression_to_register(node.args[2], "R2"))
+                code.extend(self._emit_expression_to_register(node.args[3], "R3"))
+                color_reg = self._acquire_temp_register()
+                code.extend(self._emit_expression_to_register(node.args[4], color_reg))
+                code.append(f"    RECT {color_reg}")
+                self._release_temp_register(color_reg)
+                code.append(f"    LOADI {target}, 0")  # Return 0
+                return code
+            if fname == "fillrect" and len(node.args) == 5:
+                # fillrect(x, y, w, h, color) -> FILLRECT
+                code.extend(self._emit_expression_to_register(node.args[0], "R0"))
+                code.extend(self._emit_expression_to_register(node.args[1], "R1"))
+                code.extend(self._emit_expression_to_register(node.args[2], "R2"))
+                code.extend(self._emit_expression_to_register(node.args[3], "R3"))
+                color_reg = self._acquire_temp_register()
+                code.extend(self._emit_expression_to_register(node.args[4], color_reg))
+                code.append(f"    FILLRECT {color_reg}")
+                self._release_temp_register(color_reg)
+                code.append(f"    LOADI {target}, 0")  # Return 0
+                return code
+            if fname == "circle" and len(node.args) == 4:
+                # circle(cx, cy, r, color) -> CIRCLE
+                code.extend(self._emit_expression_to_register(node.args[0], "R0"))
+                code.extend(self._emit_expression_to_register(node.args[1], "R1"))
+                code.extend(self._emit_expression_to_register(node.args[2], "R2"))
+                color_reg = self._acquire_temp_register()
+                code.extend(self._emit_expression_to_register(node.args[3], color_reg))
+                code.append(f"    CIRCLE {color_reg}")
+                self._release_temp_register(color_reg)
+                code.append(f"    LOADI {target}, 0")  # Return 0
+                return code
+            if fname == "fillcircle" and len(node.args) == 4:
+                # fillcircle(cx, cy, r, color) -> FILLCIRCLE
+                code.extend(self._emit_expression_to_register(node.args[0], "R0"))
+                code.extend(self._emit_expression_to_register(node.args[1], "R1"))
+                code.extend(self._emit_expression_to_register(node.args[2], "R2"))
+                color_reg = self._acquire_temp_register()
+                code.extend(self._emit_expression_to_register(node.args[3], color_reg))
+                code.append(f"    FILLCIRCLE {color_reg}")
+                self._release_temp_register(color_reg)
+                code.append(f"    LOADI {target}, 0")  # Return 0
+                return code
+            if fname == "getpixel" and len(node.args) == 2:
+                # getpixel(x, y) -> GETPIXEL (returns color)
+                code.extend(self._emit_expression_to_register(node.args[0], "R1"))
+                code.extend(self._emit_expression_to_register(node.args[1], "R2"))
+                code.append(f"    GETPIXEL {target}")
+                return code
+            if fname == "clear" and len(node.args) == 1:
+                # clear(color) -> CLEAR
+                color_reg = self._acquire_temp_register()
+                code.extend(self._emit_expression_to_register(node.args[0], color_reg))
+                code.append(f"    CLEAR {color_reg}")
+                self._release_temp_register(color_reg)
+                code.append(f"    LOADI {target}, 0")  # Return 0
                 return code
             # Bit helper intrinsics
             if fname == "popcount" and len(node.args) == 1:
@@ -7521,6 +7857,9 @@ class Shell:
         else:
             print(f"Executing {abs_path} at {addr:08x} (size {len(data)} bytes).")
         
+        # Print separator for program output
+        print("\n--- Program Output ---")
+        
         try:
             # Add max_steps to prevent infinite loops (10 million instructions)
             import time
@@ -7528,18 +7867,21 @@ class Shell:
             steps = self.cpu.run(max_steps=10_000_000, trace=trace_mode)
             elapsed = time.time() - start_time
             
-            # Always show execution stats
+            # Add newline after program output and show execution stats
+            print("\n--- Execution Statistics ---")
             print(f"Executed {steps:,} instructions in {elapsed:.4f}s ({steps/elapsed if elapsed > 0 else 0:,.0f} inst/sec)")
             
             if steps >= 10_000_000:
                 print(f"WARNING: Program reached maximum instruction limit ({steps:,} steps)")
         except Exception as e:
+            print("\n--- Execution Error ---")
             print("Execution error:", e)
             if debug_mode:
                 import traceback
                 traceback.print_exc()
         
         # Show key register values after execution
+        print("\n--- Final State ---")
         r0 = self.cpu.reg_read(0)
         r1 = self.cpu.reg_read(1)
         r2 = self.cpu.reg_read(2)
