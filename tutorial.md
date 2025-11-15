@@ -178,7 +178,10 @@ Edit a file (simple text editor).
 
 ```bash
 simpleos> nano myfile.txt
-# Opens editor, type content, :wq to save
+# Opens editor, type content
+# :wq to save and quit
+# :w to save
+# :q to quit without saving
 ```
 
 #### `rm <file>`
@@ -655,7 +658,55 @@ NEG R0
 ABS R0, R0
 ```
 
-### New Instructions (Phase 2)
+### Graphics Instructions (NEW!)
+
+```assembly
+; Draw pixel at (R0, R1) with color R2
+LOADI R0, 10       ; X coordinate
+LOADI R1, 10       ; Y coordinate
+LOADI R2, 0xFF     ; Red color
+PIXEL
+
+; Draw line from (R0,R1) to (R2,R3) with color in R4
+LOADI R0, 0        ; X1
+LOADI R1, 0        ; Y1
+LOADI R2, 100      ; X2
+LOADI R3, 100      ; Y2
+LOADI R4, 0xFFFF   ; White color
+LINE R4
+
+; Draw rectangle at (R0,R1) size (R2,R3) with color in R4
+LOADI R0, 50       ; X
+LOADI R1, 50       ; Y
+LOADI R2, 100      ; Width
+LOADI R3, 80       ; Height
+LOADI R4, 0xFF     ; Blue color
+RECT R4
+
+; Draw filled rectangle
+FILLRECT R4
+
+; Draw circle at (R0,R1) radius R2 with color in R4
+LOADI R0, 160      ; Center X
+LOADI R1, 100      ; Center Y
+LOADI R2, 50       ; Radius
+LOADI R4, 0xFF00   ; Green color
+CIRCLE R4
+
+; Draw filled circle
+FILLCIRCLE R4
+
+; Get pixel color at (R1,R2) into R0
+LOADI R1, 10       ; X
+LOADI R2, 10       ; Y
+GETPIXEL R0
+
+; Clear screen with color in R4
+LOADI R4, 0        ; Black
+CLEAR R4
+```
+
+### Utility Instructions (Phase 2)
 
 ```assembly
 ; Linear interpolation
@@ -918,6 +969,117 @@ int main() {
 ```
 
 ### Graphics Functions (NEW!)
+
+SimpleOS now includes 2D graphics functions for drawing pixels, lines, shapes, and more!
+
+#### Drawing Pixels
+
+```cpp
+int main() {
+    // Draw a single pixel at (x, y) with color
+    pixel(10, 10, 0xFF0000);  // Red pixel at (10, 10)
+    pixel(20, 20, 0x00FF00);  // Green pixel at (20, 20)
+    
+    // Get pixel color
+    int color = getpixel(10, 10);
+    
+    return 0;
+}
+```
+
+#### Drawing Lines
+
+```cpp
+int main() {
+    // Draw line from (x1, y1) to (x2, y2)
+    line(0, 0, 100, 100, 0xFFFFFF);  // White diagonal line
+    line(50, 50, 150, 80, 0xFF0000);  // Red line
+    
+    return 0;
+}
+```
+
+#### Drawing Rectangles
+
+```cpp
+int main() {
+    // Draw rectangle outline
+    rect(50, 50, 100, 80, 0x0000FF);  // Blue rectangle
+    
+    // Draw filled rectangle
+    fillrect(50, 50, 100, 80, 0xFF0000);  // Red filled rectangle
+    
+    return 0;
+}
+```
+
+#### Drawing Circles
+
+```cpp
+int main() {
+    // Draw circle outline
+    circle(160, 100, 50, 0x00FF00);  // Green circle
+    
+    // Draw filled circle
+    fillcircle(160, 100, 50, 0xFF0000);  // Red filled circle
+    
+    return 0;
+}
+```
+
+#### Screen Operations
+
+```cpp
+int main() {
+    // Clear screen to black
+    clear(0x000000);
+    
+    // Clear screen to white
+    clear(0xFFFFFF);
+    
+    return 0;
+}
+```
+
+#### Complete Graphics Example
+
+```cpp
+int main() {
+    // Clear screen to dark blue
+    clear(0x000064);
+    
+    // Draw a sun (yellow circle)
+    fillcircle(280, 30, 20, 0xFFFF00);
+    
+    // Draw ground (green rectangle)
+    fillrect(0, 150, 320, 50, 0x00FF00);
+    
+    // Draw a house
+    fillrect(50, 100, 80, 50, 0x8B4513);  // Brown walls
+    
+    // Draw roof (triangle with lines)
+    line(50, 100, 90, 70, 0xFF0000);
+    line(90, 70, 130, 100, 0xFF0000);
+    line(50, 100, 130, 100, 0xFF0000);
+    
+    // Draw door
+    fillrect(75, 120, 20, 30, 0x654321);
+    
+    // Draw windows
+    fillrect(60, 110, 10, 10, 0x87CEEB);
+    fillrect(110, 110, 10, 10, 0x87CEEB);
+    
+    printf("Scene drawn!");
+    return 0;
+}
+```
+
+**Graphics Specifications:**
+- **Resolution**: 320×200 pixels
+- **Color Format**: 32-bit RGBA (0xAARRGGBB)
+- **Functions**: pixel, line, rect, fillrect, circle, fillcircle, clear, getpixel
+
+### Utility Functions
 
 ```cpp
 int main() {
