@@ -1157,7 +1157,7 @@ simpleos> write hello.cpp "int main() { printf(\"Hello!\\n\"); return 0; }"
 **Edit a file:**
 ```bash
 simpleos> nano hello.cpp
-# Edit in nano, Ctrl+D to save
+# Edit in nano, :wq to save
 ```
 
 **View a file:**
