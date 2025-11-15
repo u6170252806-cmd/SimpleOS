@@ -178,7 +178,7 @@ Edit a file (simple text editor).
 
 ```bash
 simpleos> nano myfile.txt
-# Opens editor, type content, Ctrl+D to save
+# Opens editor, type content, :wq to save
 ```
 
 #### `rm <file>`
