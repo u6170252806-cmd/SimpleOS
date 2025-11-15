@@ -537,6 +537,129 @@ main:
     HALT
 ```
 
+#### Example 6: Graphics Programming (NEW!)
+```assembly
+.org 0x1000
+
+main:
+    ; Clear screen to black
+    LOADI R4, 0
+    CLEAR R4
+    
+    ; Draw a red pixel at (10, 10)
+    LOADI R0, 10     ; X
+    LOADI R1, 10     ; Y
+    LOADI R2, 0xFF   ; Red color
+    PIXEL
+    
+    ; Draw a white line from (0,0) to (100,100)
+    LOADI R0, 0      ; X1
+    LOADI R1, 0      ; Y1
+    LOADI R2, 100    ; X2
+    LOADI R3, 100    ; Y2
+    LOADI R4, 0xFFFF ; White color
+    LINE R4
+    
+    ; Draw a blue rectangle at (50,50) size (100,80)
+    LOADI R0, 50     ; X
+    LOADI R1, 50     ; Y
+    LOADI R2, 100    ; Width
+    LOADI R3, 80     ; Height
+    LOADI R4, 0xFF   ; Blue color
+    RECT R4
+    
+    ; Draw a filled red circle at (160,100) radius 50
+    LOADI R0, 160    ; Center X
+    LOADI R1, 100    ; Center Y
+    LOADI R2, 50     ; Radius
+    LOADI R4, 0xFF00 ; Red color
+    FILLCIRCLE R4
+    
+    ; Get pixel color at (10,10)
+    LOADI R1, 10     ; X
+    LOADI R2, 10     ; Y
+    GETPIXEL R0      ; Result in R0
+    
+    HALT
+```
+
+### Graphics Instructions Reference (NEW!)
+
+**PIXEL - Draw Pixel**
+```assembly
+LOADI R0, x          ; X coordinate (0-319)
+LOADI R1, y          ; Y coordinate (0-199)
+LOADI R2, color      ; 32-bit RGBA color
+PIXEL                ; Draw pixel
+```
+
+**LINE - Draw Line**
+```assembly
+LOADI R0, x1         ; Start X
+LOADI R1, y1         ; Start Y
+LOADI R2, x2         ; End X
+LOADI R3, y2         ; End Y
+LOADI R4, color      ; Line color
+LINE R4              ; Draw line
+```
+
+**RECT - Draw Rectangle Outline**
+```assembly
+LOADI R0, x          ; Top-left X
+LOADI R1, y          ; Top-left Y
+LOADI R2, width      ; Width
+LOADI R3, height     ; Height
+LOADI R4, color      ; Border color
+RECT R4              ; Draw rectangle
+```
+
+**FILLRECT - Draw Filled Rectangle**
+```assembly
+LOADI R0, x          ; Top-left X
+LOADI R1, y          ; Top-left Y
+LOADI R2, width      ; Width
+LOADI R3, height     ; Height
+LOADI R4, color      ; Fill color
+FILLRECT R4          ; Draw filled rectangle
+```
+
+**CIRCLE - Draw Circle Outline**
+```assembly
+LOADI R0, cx         ; Center X
+LOADI R1, cy         ; Center Y
+LOADI R2, radius     ; Radius
+LOADI R4, color      ; Border color
+CIRCLE R4            ; Draw circle
+```
+
+**FILLCIRCLE - Draw Filled Circle**
+```assembly
+LOADI R0, cx         ; Center X
+LOADI R1, cy         ; Center Y
+LOADI R2, radius     ; Radius
+LOADI R4, color      ; Fill color
+FILLCIRCLE R4        ; Draw filled circle
+```
+
+**GETPIXEL - Get Pixel Color**
+```assembly
+LOADI R1, x          ; X coordinate
+LOADI R2, y          ; Y coordinate
+GETPIXEL R0          ; Result in R0
+```
+
+**CLEAR - Clear Screen**
+```assembly
+LOADI R4, color      ; Background color
+CLEAR R4             ; Clear entire screen
+```
+
+**Graphics Specifications:**
+- **Resolution**: 320×200 pixels
+- **Color Format**: 32-bit RGBA (0xAARRGGBB)
+- **Coordinate System**: (0,0) is top-left, (319,199) is bottom-right
+- **Algorithms**: Bresenham (lines), Midpoint (circles)
+
 ---
 
 ## C++ Programming Guide
@@ -848,7 +971,121 @@ int main() {
 }
 ```
 
-#### Graphics Functions (NEW!)
+#### 2D Graphics Functions (NEW!)
+
+SimpleOS now includes comprehensive 2D graphics functions for drawing pixels, lines, shapes, and more!
+
+**Drawing Pixels:**
+```cpp
+int main() {
+    // Draw single pixels
+    pixel(10, 10, 0xFF0000);    // Red pixel at (10, 10)
+    pixel(20, 20, 0x00FF00);    // Green pixel at (20, 20)
+    pixel(30, 30, 0x0000FF);    // Blue pixel at (30, 30)
+    
+    // Get pixel color
+    int color = getpixel(10, 10);  // Returns 0xFF0000
+    
+    return 0;
+}
+```
+
+**Drawing Lines:**
+```cpp
+int main() {
+    // Draw line from (x1, y1) to (x2, y2) with color
+    line(0, 0, 100, 100, 0xFFFFFF);     // White diagonal
+    line(50, 50, 150, 80, 0xFF0000);    // Red line
+    line(10, 100, 310, 100, 0x00FF00);  // Green horizontal
+    
+    return 0;
+}
+```
+
+**Drawing Rectangles:**
+```cpp
+int main() {
+    // Rectangle outline
+    rect(50, 50, 100, 80, 0x0000FF);    // Blue rectangle
+    
+    // Filled rectangle
+    fillrect(50, 50, 100, 80, 0xFF0000); // Red filled rectangle
+    
+    return 0;
+}
+```
+
+**Drawing Circles:**
+```cpp
+int main() {
+    // Circle outline
+    circle(160, 100, 50, 0x00FF00);      // Green circle
+    
+    // Filled circle
+    fillcircle(160, 100, 50, 0xFF0000);  // Red filled circle
+    
+    return 0;
+}
+```
+
+**Screen Operations:**
+```cpp
+int main() {
+    // Clear screen to color
+    clear(0x000000);    // Clear to black
+    clear(0xFFFFFF);    // Clear to white
+    clear(0x000064);    // Clear to dark blue
+    
+    return 0;
+}
+```
+
+**Complete Graphics Example:**
+```cpp
+int main() {
+    // Clear screen to sky blue
+    clear(0x87CEEB);
+    
+    // Draw sun
+    fillcircle(280, 30, 20, 0xFFFF00);
+    
+    // Draw ground
+    fillrect(0, 150, 320, 50, 0x00FF00);
+    
+    // Draw house
+    fillrect(50, 100, 80, 50, 0x8B4513);  // Brown walls
+    
+    // Draw roof (triangle with lines)
+    line(50, 100, 90, 70, 0xFF0000);
+    line(90, 70, 130, 100, 0xFF0000);
+    line(50, 100, 130, 100, 0xFF0000);
+    
+    // Draw door
+    fillrect(75, 120, 20, 30, 0x654321);
+    
+    // Draw windows
+    fillrect(60, 110, 10, 10, 0x87CEEB);
+    fillrect(110, 110, 10, 10, 0x87CEEB);
+    
+    printf("Scene complete!");
+    return 0;
+}
+```
+
+**Graphics Specifications:**
+- **Resolution**: 320×200 pixels (64,000 pixels total)
+- **Color Format**: 32-bit RGBA (0xAARRGGBB)
+- **Available Functions**: 8 graphics functions
+  - `pixel(x, y, color)` - Draw single pixel
+  - `line(x1, y1, x2, y2, color)` - Draw line
+  - `rect(x, y, w, h, color)` - Draw rectangle outline
+  - `fillrect(x, y, w, h, color)` - Draw filled rectangle
+  - `circle(cx, cy, r, color)` - Draw circle outline
+  - `fillcircle(cx, cy, r, color)` - Draw filled circle
+  - `clear(color)` - Clear entire screen
+  - `getpixel(x, y)` - Get pixel color
+
+#### Utility Functions
 
 ```cpp
 int main() {
@@ -1157,7 +1394,10 @@ simpleos> write hello.cpp "int main() { printf(\"Hello!\\n\"); return 0; }"
 **Edit a file:**
 ```bash
 simpleos> nano hello.cpp
-# Edit in nano, :wq to save
+# Edit in nano
+# :wq to save and quit
+# :w to save
+# :q to quit without saving
 ```
 
 **View a file:**
@@ -1450,6 +1690,311 @@ source:
 
 dest:
     .word 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+```
+
+### Example 8: Simple Graphics Scene (C++) - NEW!
+
+```cpp
+int main() {
+    printf("Drawing a simple scene...\n");
+    
+    // Clear screen to sky blue
+    clear(0x87CEEB);
+    
+    // Draw sun (yellow circle)
+    fillcircle(280, 30, 20, 0xFFFF00);
+    
+    // Draw ground (green rectangle)
+    fillrect(0, 150, 320, 50, 0x00FF00);
+    
+    // Draw house
+    fillrect(50, 100, 80, 50, 0x8B4513);  // Brown walls
+    
+    // Draw roof (triangle with lines)
+    line(50, 100, 90, 70, 0xFF0000);      // Left roof
+    line(90, 70, 130, 100, 0xFF0000);     // Right roof
+    line(50, 100, 130, 100, 0xFF0000);    // Base
+    
+    // Draw door
+    fillrect(75, 120, 20, 30, 0x654321);
+    
+    // Draw windows
+    fillrect(60, 110, 10, 10, 0x87CEEB);
+    fillrect(110, 110, 10, 10, 0x87CEEB);
+    
+    printf("Scene complete!\n");
+    return 0;
+}
+```
+
+**How to run:**
+```bash
+simpleos> write scene.cpp "int main() { ..."
+simpleos> cas++ scene.cpp --run
+
+--- Program Output ---
+Drawing a simple scene...
+Scene complete!
+
+--- Execution Statistics ---
+Executed 45 instructions in 0.0012s
+```
+
+### Example 9: Bouncing Ball Animation (C++) - NEW!
+
+```cpp
+int main() {
+    printf("Bouncing ball animation\n");
+    
+    int x = 160;
+    int y = 100;
+    int dx = 2;
+    int dy = 2;
+    int radius = 10;
+    
+    // Animate for 100 frames
+    int frame = 0;
+    for (frame = 0; frame < 100; frame++) {
+        // Clear screen
+        clear(0x000000);
+        
+        // Draw ball
+        fillcircle(x, y, radius, 0xFF0000);
+        
+        // Update position
+        x = x + dx;
+        y = y + dy;
+        
+        // Bounce off edges
+        if (x < radius) {
+            dx = 2;
+        }
+        if (x > 310) {
+            dx = -2;
+        }
+        if (y < radius) {
+            dy = 2;
+        }
+        if (y > 190) {
+            dy = -2;
+        }
+        
+        // Frame delay
+        sleep(16);  // ~60 FPS
+    }
+    
+    printf("Animation complete!\n");
+    return 0;
+}
+```
+
+### Example 10: Drawing Patterns (C++) - NEW!
+
+```cpp
+int main() {
+    printf("Drawing geometric patterns\n");
+    
+    // Clear to black
+    clear(0x000000);
+    
+    // Draw grid pattern
+    int x = 0;
+    while (x < 320) {
+        line(x, 0, x, 199, 0x404040);  // Vertical lines
+        x = x + 20;
+    }
+    
+    int y = 0;
+    while (y < 200) {
+        line(0, y, 319, y, 0x404040);  // Horizontal lines
+        y = y + 20;
+    }
+    
+    // Draw concentric circles
+    int r = 10;
+    while (r < 100) {
+        circle(160, 100, r, 0xFFFFFF);
+        r = r + 10;
+    }
+    
+    // Draw diagonal lines
+    int i = 0;
+    for (i = 0; i < 10; i++) {
+        int offset = i * 30;
+        line(0, offset, 319, offset + 100, 0xFF0000);
+    }
+    
+    printf("Pattern complete!\n");
+    return 0;
+}
+```
+
+### Example 11: Pixel Art Drawing (C++) - NEW!
+
+```cpp
+int main() {
+    printf("Drawing pixel art\n");
+    
+    clear(0xFFFFFF);  // White background
+    
+    // Draw a simple smiley face
+    
+    // Face (yellow circle)
+    fillcircle(160, 100, 40, 0xFFFF00);
+    circle(160, 100, 40, 0x000000);
+    
+    // Left eye
+    fillcircle(145, 90, 5, 0x000000);
+    
+    // Right eye
+    fillcircle(175, 90, 5, 0x000000);
+    
+    // Smile (draw with pixels)
+    int x = 145;
+    while (x <= 175) {
+        int y = 110;
+        
+        // Curve calculation (simple parabola)
+        int dx = x - 160;
+        int curve = (dx * dx) / 40;
+        y = y + curve;
+        
+        pixel(x, y, 0x000000);
+        x = x + 1;
+    }
+    
+    printf("Smiley face complete!\n");
+    return 0;
+}
+```
+
+### Example 12: Color Gradient (C++) - NEW!
+
+```cpp
+int main() {
+    printf("Drawing color gradient\n");
+    
+    // Horizontal gradient (left to right)
+    int x = 0;
+    for (x = 0; x < 320; x++) {
+        // Calculate color based on position
+        int t = (x * 255) / 319;
+        int color = lerp(0x0000FF, 0xFF0000, t);
+        
+        // Draw vertical line
+        int y = 0;
+        for (y = 0; y < 100; y++) {
+            pixel(x, y, color);
+        }
+    }
+    
+    // Vertical gradient (top to bottom)
+    int y = 100;
+    for (y = 100; y < 200; y++) {
+        // Calculate color based on position
+        int t = ((y - 100) * 255) / 99;
+        int color = lerp(0x00FF00, 0xFFFF00, t);
+        
+        // Draw horizontal line
+        x = 0;
+        for (x = 0; x < 320; x++) {
+            pixel(x, y, color);
+        }
+    }
+    
+    printf("Gradient complete!\n");
+    return 0;
+}
+```
+
+### Example 13: Interactive Drawing (C++) - NEW!
+
+```cpp
+int main() {
+    printf("Drawing interactive shapes\n");
+    
+    clear(0x000000);
+    
+    // Draw based on random values
+    int i = 0;
+    for (i = 0; i < 20; i++) {
+        // Random position
+        int x = rand() % 320;
+        int y = rand() % 200;
+        
+        // Random size
+        int size = (rand() % 30) + 10;
+        
+        // Random color
+        int r = rand() % 256;
+        int g = rand() % 256;
+        int b = rand() % 256;
+        int color = (r << 16) | (g << 8) | b;
+        
+        // Random shape
+        int shape = rand() % 3;
+        
+        if (shape == 0) {
+            // Circle
+            fillcircle(x, y, size, color);
+        } else if (shape == 1) {
+            // Rectangle
+            fillrect(x, y, size, size, color);
+        } else {
+            // Line
+            int x2 = rand() % 320;
+            int y2 = rand() % 200;
+            line(x, y, x2, y2, color);
+        }
+        
+        sleep(100);  // Delay between shapes
+    }
+    
+    printf("Drawing complete!\n");
+    return 0;
+}
+```
+
+### Example 14: Game HUD (C++) - NEW!
+
+```cpp
+int main() {
+    printf("Drawing game HUD\n");
+    
+    clear(0x000000);
+    
+    // Health bar
+    int health = 75;  // 75%
+    int bar_width = (health * 100) / 100;
+    
+    // Background
+    rect(10, 10, 100, 10, 0xFFFFFF);
+    
+    // Health (green)
+    fillrect(10, 10, bar_width, 10, 0x00FF00);
+    
+    // Score display (draw numbers as rectangles)
+    int score = 1234;
+    
+    // Draw score boxes
+    fillrect(200, 10, 20, 20, 0xFFFF00);
+    fillrect(225, 10, 20, 20, 0xFFFF00);
+    fillrect(250, 10, 20, 20, 0xFFFF00);
+    fillrect(275, 10, 20, 20, 0xFFFF00);
+    
+    // Minimap
+    rect(250, 150, 60, 40, 0xFFFFFF);
+    
+    // Player position on minimap
+    fillcircle(280, 170, 3, 0xFF0000);
+    
+    // Enemy positions
+    fillcircle(260, 160, 2, 0x0000FF);
+    fillcircle(290, 180, 2, 0x0000FF);
+    
+    printf("HUD complete!\n");
+    return 0;
+}
 ```
 
 ---
