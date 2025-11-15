@@ -31,7 +31,7 @@ Welcome to SimpleOS! This is a complete operating system emulator with:
 ### Starting SimpleOS
 
 ```bash
-python3 pycpu.py
+python3 SimpleOS.py
 ```
 
 You'll see:
