@@ -7191,6 +7191,7 @@ class Shell:
                         print("  memory    - Memory and CPU operations")
                         print("  network   - Network simulation commands")
                         print("  cpp       - C++ compiler commands")
+                        print("  games     - Terminal games (Snake, Minesweeper, Tetris)")
                         print("  util      - Utility commands")
                         print("\nUse 'help <category>' to see specific commands.")
                         # continue main loop (don't exit shell)
@@ -7291,6 +7292,17 @@ class Shell:
                         print("  download <url> [file]    - Download and save file")
                         print("  nettest <host> <port>    - Test network connectivity")
                         print("  netsocket <cmd> [args]   - Socket operations (create, connect, send, recv, close)")
+                    elif category == "games":
+                        print("Terminal Games:")
+                        print("  snake       - Play Snake game")
+                        print("  minesweeper - Play Minesweeper")
+                        print("  tetris      - Play Tetris (auto-falling!)")
+                        print("\nControls:")
+                        print("  Snake:       w/a/s/d to change direction, Enter to move, q to quit")
+                        print("  Minesweeper: 'row col' to reveal (e.g., '3 4')")
+                        print("                'f row col' to flag, q to quit")
+                        print("  Tetris:      a/d to move, w to rotate, s to drop fast, q to quit")
+                        print("                Pieces fall automatically every 0.8 seconds!")
                     elif category == "util":
                         print("Utility Commands:")
                         print("  echo      - Print text")
@@ -7529,6 +7541,13 @@ class Shell:
                     self.do_export(args)
                 elif cmd == "unset":
                     self.do_unset(args)
+                # Game commands
+                elif cmd == "snake":
+                    self.do_snake(args)
+                elif cmd == "minesweeper":
+                    self.do_minesweeper(args)
+                elif cmd == "tetris":
+                    self.do_tetris(args)
                 else:
                     print("Unknown command. Type 'help'.")
             except Exception as e:
@@ -9127,6 +9146,453 @@ error:
                 print(f"Unset {var}")
             else:
                 print(f"Variable {var} not found")
+    
+    # ===== TERMINAL GAMES =====
+    
+    def do_snake(self, args):
+        """Play Snake game in terminal"""
+        import random
+        import time
+        
+        print("=" * 50)
+        print("SNAKE GAME")
+        print("=" * 50)
+        print("Controls: w=up, s=down, a=left, d=right")
+        print("Just press Enter after each move")
+        print("Type 'q' to quit")
+        print("Press Enter to start...")
+        input()
+        
+        # Game setup
+        width, height = 20, 10
+        snake = [[5, 5], [5, 4], [5, 3]]
+        direction = [1, 0]  # right
+        food = [random.randint(0, width-1), random.randint(0, height-1)]
+        score = 0
+        game_over = False
+        move_count = 0
+        
+        while not game_over:
+            # Clear screen
+            print("\033[2J\033[H", end="")
+            
+            # Draw
+            print(f"SNAKE - Score: {score}")
+            print("+" + "-" * width + "+")
+            
+            for y in range(height):
+                row = "|"
+                for x in range(width):
+                    if [x, y] in snake:
+                        row += "O" if [x, y] == snake[0] else "o"
+                    elif [x, y] == food:
+                        row += "*"
+                    else:
+                        row += " "
+                row += "|"
+                print(row)
+            
+            print("+" + "-" * width + "+")
+            print(f"Direction: {'→' if direction==[1,0] else '←' if direction==[-1,0] else '↑' if direction==[0,-1] else '↓'}")
+            print("Move: w=up, s=down, a=left, d=right, q=quit, Enter=continue")
+            
+            # Get input
+            try:
+                move = input("> ").strip().lower()
+                
+                if move == "q":
+                    print("\nGame ended!")
+                    break
+                elif move == "w" and direction != [0, 1]:
+                    direction = [0, -1]
+                elif move == "s" and direction != [0, -1]:
+                    direction = [0, 1]
+                elif move == "a" and direction != [1, 0]:
+                    direction = [-1, 0]
+                elif move == "d" and direction != [-1, 0]:
+                    direction = [1, 0]
+                # Empty input just continues in current direction
+            except:
+                pass
+            
+            # Move snake
+            head = [snake[0][0] + direction[0], snake[0][1] + direction[1]]
+            
+            # Check collision with walls
+            if head[0] < 0 or head[0] >= width or head[1] < 0 or head[1] >= height:
+                print("\033[2J\033[H", end="")
+                print("+" + "-" * width + "+")
+                for y in range(height):
+                    row = "|"
+                    for x in range(width):
+                        if [x, y] in snake:
+                            row += "X"
+                        else:
+                            row += " "
+                    row += "|"
+                    print(row)
+                print("+" + "-" * width + "+")
+                print("\n💥 Game Over! Hit wall!")
+                print(f"Final Score: {score}")
+                input("Press Enter to continue...")
+                game_over = True
+                continue
+            
+            # Check collision with self
+            if head in snake:
+                print("\033[2J\033[H", end="")
+                print("+" + "-" * width + "+")
+                for y in range(height):
+                    row = "|"
+                    for x in range(width):
+                        if [x, y] in snake:
+                            row += "X"
+                        else:
+                            row += " "
+                    row += "|"
+                    print(row)
+                print("+" + "-" * width + "+")
+                print("\n💥 Game Over! Hit yourself!")
+                print(f"Final Score: {score}")
+                input("Press Enter to continue...")
+                game_over = True
+                continue
+            
+            # Add new head
+            snake.insert(0, head)
+            
+            # Check if ate food
+            if head == food:
+                score += 10
+                food = [random.randint(0, width-1), random.randint(0, height-1)]
+                while food in snake:
+                    food = [random.randint(0, width-1), random.randint(0, height-1)]
+            else:
+                snake.pop()
+            
+            move_count += 1
+    
+    def do_minesweeper(self, args):
+        """Play Minesweeper in terminal"""
+        import random
+        import time
+        
+        print("=" * 50)
+        print("MINESWEEPER")
+        print("=" * 50)
+        print("Enter row and column (e.g., '3 4' to reveal)")
+        print("Type 'f 3 4' to flag/unflag")
+        print("Type 'q' to quit")
+        print()
+        
+        # Game setup
+        size = 8
+        mines = 10
+        board = [[0 for _ in range(size)] for _ in range(size)]
+        revealed = [[False for _ in range(size)] for _ in range(size)]
+        flagged = [[False for _ in range(size)] for _ in range(size)]
+        
+        # Place mines
+        mine_positions = set()
+        while len(mine_positions) < mines:
+            x, y = random.randint(0, size-1), random.randint(0, size-1)
+            mine_positions.add((x, y))
+            board[y][x] = -1  # -1 = mine
+        
+        # Calculate numbers
+        for y in range(size):
+            for x in range(size):
+                if board[y][x] != -1:
+                    count = 0
+                    for dy in [-1, 0, 1]:
+                        for dx in [-1, 0, 1]:
+                            ny, nx = y + dy, x + dx
+                            if 0 <= ny < size and 0 <= nx < size and board[ny][nx] == -1:
+                                count += 1
+                    board[y][x] = count
+        
+        game_over = False
+        
+        while not game_over:
+            # Clear screen
+            print("\033[2J\033[H", end="")
+            
+            # Draw board
+            print("MINESWEEPER - Find all mines!")
+            print(f"Mines: {mines}  |  Flags: {sum(sum(1 for cell in row if cell) for row in flagged)}")
+            print("\n    ", end="")
+            for x in range(size):
+                print(f"{x} ", end="")
+            print()
+            
+            for y in range(size):
+                print(f"  {y} ", end="")
+                for x in range(size):
+                    if flagged[y][x]:
+                        print("F ", end="")
+                    elif revealed[y][x]:
+                        if board[y][x] == -1:
+                            print("* ", end="")
+                        elif board[y][x] == 0:
+                            print("  ", end="")
+                        else:
+                            print(f"{board[y][x]} ", end="")
+                    else:
+                        print("■ ", end="")
+                print()
+            
+            # Get input
+            print("\nCommands:")
+            print("  'row col' to reveal (e.g., '3 4')")
+            print("  'f row col' to flag (e.g., 'f 3 4')")
+            print("  'q' to quit")
+            
+            try:
+                cmd = input("\n> ").strip().lower()
+                
+                if cmd == "q":
+                    print("Game ended!")
+                    break
+                
+                parts = cmd.split()
+                
+                if len(parts) == 2 and parts[0] != "f":
+                    # Reveal cell
+                    y, x = int(parts[0]), int(parts[1])
+                    if 0 <= x < size and 0 <= y < size and not flagged[y][x]:
+                        if board[y][x] == -1:
+                            revealed[y][x] = True
+                            # Show all mines
+                            for my in range(size):
+                                for mx in range(size):
+                                    if board[my][mx] == -1:
+                                        revealed[my][mx] = True
+                            # Redraw
+                            print("\033[2J\033[H", end="")
+                            print("BOOM! You hit a mine!")
+                            print("\n    ", end="")
+                            for x in range(size):
+                                print(f"{x} ", end="")
+                            print()
+                            for y in range(size):
+                                print(f"  {y} ", end="")
+                                for x in range(size):
+                                    if revealed[y][x] and board[y][x] == -1:
+                                        print("* ", end="")
+                                    elif revealed[y][x]:
+                                        print(f"{board[y][x]} " if board[y][x] > 0 else "  ", end="")
+                                    else:
+                                        print("■ ", end="")
+                                print()
+                            print("\nGame Over!")
+                            input("Press Enter to continue...")
+                            game_over = True
+                        else:
+                            revealed[y][x] = True
+                            # Check win
+                            revealed_count = sum(sum(1 for cell in row if cell) for row in revealed)
+                            if revealed_count == size * size - mines:
+                                print("\n🎉 Congratulations! You won!")
+                                input("Press Enter to continue...")
+                                game_over = True
+                    else:
+                        print("Invalid coordinates or cell is flagged!")
+                        time.sleep(1)
+                        
+                elif len(parts) == 3 and parts[0] == "f":
+                    # Flag cell
+                    y, x = int(parts[1]), int(parts[2])
+                    if 0 <= x < size and 0 <= y < size and not revealed[y][x]:
+                        flagged[y][x] = not flagged[y][x]
+                    else:
+                        print("Invalid coordinates or cell already revealed!")
+                        time.sleep(1)
+                else:
+                    print("Invalid command! Use 'row col' or 'f row col'")
+                    time.sleep(1)
+            except ValueError:
+                print("Invalid input! Use numbers only.")
+                time.sleep(1)
+            except Exception as e:
+                print(f"Error: {e}")
+                time.sleep(1)
+    
+    def do_tetris(self, args):
+        """Play Tetris in terminal"""
+        import random
+        import time
+        import sys
+        import select
+        
+        print("=" * 50)
+        print("TETRIS")
+        print("=" * 50)
+        print("Controls: a=left, d=right, w=rotate, s=drop fast")
+        print("Pieces fall automatically!")
+        print("Type commands and press Enter")
+        print("Press Enter to start...")
+        input()
+        
+        # Game setup
+        width, height = 10, 20
+        board = [[0 for _ in range(width)] for _ in range(height)]
+        
+        # Tetromino shapes
+        shapes = [
+            [[1, 1, 1, 1]],  # I
+            [[1, 1], [1, 1]],  # O
+            [[1, 1, 1], [0, 1, 0]],  # T
+            [[1, 1, 1], [1, 0, 0]],  # L
+            [[1, 1, 1], [0, 0, 1]],  # J
+            [[1, 1, 0], [0, 1, 1]],  # S
+            [[0, 1, 1], [1, 1, 0]],  # Z
+        ]
+        
+        score = 0
+        current_piece = random.choice(shapes)
+        piece_x, piece_y = width // 2 - 1, 0
+        game_over = False
+        last_fall = time.time()
+        fall_speed = 0.8  # Seconds between falls
+        
+        def can_place(piece, x, y):
+            for py, row in enumerate(piece):
+                for px, cell in enumerate(row):
+                    if cell:
+                        nx, ny = x + px, y + py
+                        if nx < 0 or nx >= width or ny >= height:
+                            return False
+                        if ny >= 0 and board[ny][nx]:
+                            return False
+            return True
+        
+        def rotate(piece):
+            return [[piece[y][x] for y in range(len(piece)-1, -1, -1)] for x in range(len(piece[0]))]
+        
+        def draw_game():
+            # Clear screen
+            print("\033[2J\033[H", end="")
+            
+            # Draw
+            print(f"TETRIS - Score: {score}")
+            print("+" + "-" * width + "+")
+            
+            # Create display board
+            display = [row[:] for row in board]
+            for py, row in enumerate(current_piece):
+                for px, cell in enumerate(row):
+                    if cell:
+                        nx, ny = piece_x + px, piece_y + py
+                        if 0 <= ny < height and 0 <= nx < width:
+                            display[ny][nx] = 2
+            
+            for row in display:
+                print("|" + "".join("█" if cell == 1 else "▓" if cell == 2 else " " for cell in row) + "|")
+            
+            print("+" + "-" * width + "+")
+            print("Controls: a=left, d=right, w=rotate, s=drop, q=quit")
+            print("> ", end="", flush=True)
+        
+        # Set stdin to non-blocking mode
+        import os
+        import fcntl
+        fd = sys.stdin.fileno()
+        flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+        fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+        
+        input_buffer = ""
+        
+        try:
+            while not game_over:
+                draw_game()
+                
+                # Check for input with timeout
+                current_time = time.time()
+                time_until_fall = fall_speed - (current_time - last_fall)
+                
+                if time_until_fall > 0:
+                    # Wait for input or timeout
+                    ready, _, _ = select.select([sys.stdin], [], [], min(time_until_fall, 0.1))
+                    
+                    if ready:
+                        try:
+                            char = sys.stdin.read(1)
+                            if char == '\n':
+                                # Process command
+                                cmd = input_buffer.strip().lower()
+                                input_buffer = ""
+                                
+                                if cmd == "q":
+                                    print("\n\nGame ended!")
+                                    game_over = True
+                                    break
+                                elif cmd == "a":
+                                    if can_place(current_piece, piece_x - 1, piece_y):
+                                        piece_x -= 1
+                                elif cmd == "d":
+                                    if can_place(current_piece, piece_x + 1, piece_y):
+                                        piece_x += 1
+                                elif cmd == "w":
+                                    rotated = rotate(current_piece)
+                                    if can_place(rotated, piece_x, piece_y):
+                                        current_piece = rotated
+                                elif cmd == "s":
+                                    # Fast drop
+                                    while can_place(current_piece, piece_x, piece_y + 1):
+                                        piece_y += 1
+                                        score += 1
+                            else:
+                                input_buffer += char
+                        except:
+                            pass
+                
+                # Auto fall
+                if time.time() - last_fall >= fall_speed:
+                    last_fall = time.time()
+                    
+                    if can_place(current_piece, piece_x, piece_y + 1):
+                        piece_y += 1
+                    else:
+                        # Lock piece
+                        for py, row in enumerate(current_piece):
+                            for px, cell in enumerate(row):
+                                if cell:
+                                    nx, ny = piece_x + px, piece_y + py
+                                    if 0 <= ny < height and 0 <= nx < width:
+                                        board[ny][nx] = 1
+                        
+                        # Check for completed lines
+                        lines_cleared = 0
+                        y = height - 1
+                        while y >= 0:
+                            if all(board[y]):
+                                board.pop(y)
+                                board.insert(0, [0 for _ in range(width)])
+                                lines_cleared += 1
+                                score += 100
+                            else:
+                                y -= 1
+                        
+                        # New piece
+                        current_piece = random.choice(shapes)
+                        piece_x, piece_y = width // 2 - 1, 0
+                        
+                        if not can_place(current_piece, piece_x, piece_y):
+                            print("\033[2J\033[H", end="")
+                            print("+" + "-" * width + "+")
+                            for row in board:
+                                print("|" + "".join("█" if cell else " " for cell in row) + "|")
+                            print("+" + "-" * width + "+")
+                            print("\n💥 Game Over!")
+                            print(f"Final Score: {score}")
+                            game_over = True
+        finally:
+            # Restore stdin to blocking mode
+            fcntl.fcntl(fd, fcntl.F_SETFL, flags)
+            if not game_over:
+                print()
+            input("\nPress Enter to continue...")
+
     
     def do_hexdump(self, args):
         """Hexdump of file or memory"""
