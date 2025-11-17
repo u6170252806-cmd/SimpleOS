@@ -422,6 +422,10 @@ OP_CIRCLE = 0xA5     # Draw circle outline: CIRCLE x, y, r, color
 OP_FILLCIRCLE = 0xA6 # Draw filled circle: FILLCIRCLE x, y, r, color
 OP_GETPIXEL = 0xA7   # Get pixel color: GETPIXEL dst, x, y
 OP_CLEAR = 0xA8      # Clear screen: CLEAR color
+# New useful opcodes for better performance
+OP_MULH = 0xA9       # Multiply High: Get upper 32 bits of 64-bit multiplication
+OP_DIVMOD = 0xAA     # Combined DIV/MOD: dst=quotient, src gets remainder
+OP_AVGB = 0xAB       # Average bytes: Average of two values (useful for blending)
 
 OPCODE_NAME = {
     OP_NOP: "NOP", OP_MOV: "MOV", OP_LOADI: "LOADI", OP_LOAD: "LOAD", OP_STORE: "STORE",
@@ -474,6 +478,7 @@ OPCODE_NAME = {
     OP_LERP: "LERP", OP_SIGN: "SIGN", OP_SATURATE: "SATURATE",
     OP_PIXEL: "PIXEL", OP_LINE: "LINE", OP_RECT: "RECT", OP_FILLRECT: "FILLRECT",
     OP_CIRCLE: "CIRCLE", OP_FILLCIRCLE: "FILLCIRCLE", OP_GETPIXEL: "GETPIXEL", OP_CLEAR: "CLEAR",
+    OP_MULH: "MULH", OP_DIVMOD: "DIVMOD", OP_AVGB: "AVGB",
     OP_SETG: "SETG", OP_SETLE: "SETLE", OP_SETGE: "SETGE", OP_SETNE: "SETNE", OP_SETE: "SETE",
     OP_LOOP: "LOOP", OP_LOOPZ: "LOOPZ", OP_LOOPNZ: "LOOPNZ",
     OP_REP: "REP", OP_REPZ: "REPZ", OP_REPNZ: "REPNZ",
@@ -2118,6 +2123,14 @@ class Kernel:
             cpu.reg_write(0, lines & 0xFFFFFFFF)
             cpu.reg_write(1, words & 0xFFFFFFFF)
             cpu.reg_write(2, chars & 0xFFFFFFFF)
+        elif num == 50:  # PRINT_INT - Print integer to stdout
+            value = a1
+            # Convert to signed 32-bit integer
+            if value & 0x80000000:
+                value = value - 0x100000000
+            sys.stdout.write(str(value))
+            sys.stdout.flush()
+            cpu.reg_write(0, 1)
         else:
             logger.warning("Unknown syscall %d", num)
             cpu.reg_write(0, 0)
@@ -4153,6 +4166,41 @@ class CPU:
             else:
                 result = val
             self.reg_write(dst, result)
+        elif opcode == OP_MULH:
+            # MULH: Multiply High - Get upper 32 bits of 64-bit multiplication
+            # Useful for fixed-point arithmetic and overflow detection
+            a = self.reg_read(dst)
+            b = self.reg_read(src)
+            # Perform 64-bit multiplication
+            result_64 = a * b
+            # Get upper 32 bits
+            high_bits = (result_64 >> 32) & 0xFFFFFFFF
+            self.reg_write(dst, high_bits)
+            self.update_zero_and_neg_flags(high_bits)
+        elif opcode == OP_DIVMOD:
+            # DIVMOD: Combined division and modulo for efficiency
+            # dst = quotient, src register gets remainder
+            # More efficient than separate DIV and MOD operations
+            dividend = self.reg_read(dst)
+            divisor = self.reg_read(src)
+            if divisor == 0:
+                self.set_flag(FLAG_OVERFLOW)
+                self.reg_write(dst, 0xFFFFFFFF)
+                self.reg_write(src, 0)
+            else:
+                quotient = dividend // divisor
+                remainder = dividend % divisor
+                self.reg_write(dst, quotient & 0xFFFFFFFF)
+                self.reg_write(src, remainder & 0xFFFFFFFF)
+                self.update_zero_and_neg_flags(quotient)
+        elif opcode == OP_AVGB:
+            # AVGB: Average of two values (useful for blending/interpolation)
+            # dst = (dst + src) / 2, rounded down
+            a = self.reg_read(dst)
+            b = self.reg_read(src)
+            avg = (a + b) >> 1
+            self.reg_write(dst, avg & 0xFFFFFFFF)
+            self.update_zero_and_neg_flags(avg)
         # Graphics opcodes
         elif opcode == OP_PIXEL:
             # PIXEL: Draw pixel at (R0, R1) with color R2
@@ -5082,7 +5130,7 @@ class Assembler:
                 word = 0
                 if opcode in (OP_NOP, OP_NOP2, OP_NOP3, OP_NOP4, OP_RET, OP_HALT, OP_CLC, OP_STC, OP_CLI, OP_STI, OP_IRET, OP_LEAVE, OP_FLDZ, OP_FLD1, OP_FLDPI, OP_FLDLG2, OP_FLDLN2, OP_FCLEX, OP_NEG, OP_CBW, OP_CWD, OP_CWDQ, OP_CLD, OP_STD, OP_LAHF, OP_SAHF, OP_INTO, OP_AAM, OP_AAD, OP_XLAT, OP_XCHG, OP_CMPXCHG, OP_LAR, OP_LSL, OP_SLDT, OP_STR, OP_LLDT, OP_LTR, OP_VERR, OP_VERW, OP_SGDT, OP_SIDT, OP_LGDT, OP_LIDT, OP_SMSW, OP_LMSW, OP_CLTS, OP_INVD, OP_WBINVD, OP_INVLPG, OP_INVPCID, OP_VMCALL, OP_VMLAUNCH, OP_VMRESUME, OP_VMXOFF, OP_MONITOR, OP_MWAIT, OP_RDSEED, OP_RDRAND, OP_CLAC, OP_STAC, OP_SKINIT, OP_SVMEXIT, OP_SVMRET, OP_SVMLOCK, OP_SVMUNLOCK, OP_NET_CLOSE, OP_SWAP, OP_REVERSE, OP_RDTSC, OP_RDMSR, OP_WRMSR, OP_PAUSE, OP_LOCK, OP_REPNE, OP_REPE, OP_REP, OP_REPZ, OP_REPNZ, OP_MOVSB, OP_MOVSW, OP_MOVSD, OP_CMPSB, OP_SCASB, OP_LODSB, OP_STOSB):
                     word = pack_instruction(opcode, 0, 0, 0)
-                elif opcode in (OP_MOV, OP_ADD, OP_SUB, OP_AND, OP_OR, OP_XOR, OP_CMP, OP_TEST, OP_SHL, OP_SHR, OP_MUL, OP_IMUL, OP_DIV, OP_IDIV, OP_MOD, OP_FADD, OP_FSUB, OP_FMUL, OP_FDIV, OP_FCOMP, OP_FXCH, OP_ADC, OP_SBB, OP_ROL, OP_ROR, OP_BT, OP_BTS, OP_BTR, OP_BSF, OP_BSR, OP_ACCADD, OP_ACCSUB, OP_SETACC, OP_GETACC, OP_NET_SEND, OP_NET_RECV, OP_NET_CONNECT, OP_ROT, OP_HASH, OP_CRC32, OP_GETTIME, OP_SETSEED, OP_MIN, OP_MAX, OP_ABS, OP_POPCNT, OP_STRLEN, OP_STRCMP, OP_SLEEP, OP_SQRT, OP_POW, OP_LOG, OP_EXP, OP_SIN, OP_COS, OP_TAN):
+                elif opcode in (OP_MOV, OP_ADD, OP_SUB, OP_AND, OP_OR, OP_XOR, OP_CMP, OP_TEST, OP_SHL, OP_SHR, OP_MUL, OP_IMUL, OP_DIV, OP_IDIV, OP_MOD, OP_FADD, OP_FSUB, OP_FMUL, OP_FDIV, OP_FCOMP, OP_FXCH, OP_ADC, OP_SBB, OP_ROL, OP_ROR, OP_BT, OP_BTS, OP_BTR, OP_BSF, OP_BSR, OP_ACCADD, OP_ACCSUB, OP_SETACC, OP_GETACC, OP_NET_SEND, OP_NET_RECV, OP_NET_CONNECT, OP_ROT, OP_HASH, OP_CRC32, OP_GETTIME, OP_SETSEED, OP_MIN, OP_MAX, OP_ABS, OP_POPCNT, OP_STRLEN, OP_STRCMP, OP_SLEEP, OP_SQRT, OP_POW, OP_LOG, OP_EXP, OP_SIN, OP_COS, OP_TAN, OP_MULH, OP_DIVMOD, OP_AVGB):
                     if len(args) != 2:
                         raise AssemblerError(f"{mnem} requires two operands on line {ln}")
                     dst = self.parse_reg(args[0])
@@ -5238,12 +5286,68 @@ class Assembler:
             if label not in self.used_labels:
                 self.warnings.append(f"Unused label: {label}")
     
+    def optimize_instructions(self, lines: List[Tuple[int, str]]) -> List[Tuple[int, str]]:
+        """Apply peephole optimizations to instruction stream"""
+        if self.optimization_level == 0:
+            return lines
+        
+        optimized = []
+        i = 0
+        optimizations = 0
+        
+        while i < len(lines):
+            ln, line = lines[i]
+            
+            # Optimization 1: Remove redundant MOV R0, R0
+            if "MOV R0, R0" in line.upper():
+                i += 1
+                optimizations += 1
+                continue
+            
+            # Optimization 2: Combine LOADI + ADD into ADDI
+            if i + 1 < len(lines):
+                next_ln, next_line = lines[i + 1]
+                if "LOADI" in line.upper() and "ADD" in next_line.upper():
+                    # Try to combine into ADDI
+                    loadi_match = re.match(r'\s*LOADI\s+(R\d+),\s*(\d+)', line, re.IGNORECASE)
+                    add_match = re.match(r'\s*ADD\s+(R\d+),\s+(R\d+)', next_line, re.IGNORECASE)
+                    if loadi_match and add_match:
+                        reg1 = loadi_match.group(1)
+                        imm = loadi_match.group(2)
+                        dst = add_match.group(1)
+                        src = add_match.group(2)
+                        if reg1.upper() == src.upper():
+                            # Can optimize to ADDI
+                            optimized.append((ln, f"    ADDI {dst}, {imm}  ; optimized"))
+                            i += 2
+                            optimizations += 1
+                            continue
+            
+            # Optimization 3: Remove NOP instructions (unless debugging)
+            if self.optimization_level >= 2 and "NOP" in line.upper() and not line.strip().startswith(";"):
+                i += 1
+                optimizations += 1
+                continue
+            
+            optimized.append((ln, line))
+            i += 1
+        
+        if optimizations > 0:
+            self.warnings.append(f"Applied {optimizations} peephole optimizations")
+        
+        return optimized
+    
     def assemble(self, text: str) -> bytes:
         self.clear_errors()
         self.first_pass(text)
         if self.errors:
             error_msg = "Assembly errors:\n" + "\n".join(self.errors)
             raise AssemblerError(error_msg)
+        
+        # Apply optimizations if enabled
+        if self.optimization_level > 0:
+            self.lines = self.optimize_instructions(self.lines)
+        
         result = self.second_pass()
         if self.errors:
             error_msg = "Assembly errors:\n" + "\n".join(self.errors)
@@ -5276,6 +5380,7 @@ class CppCompiler:
         self._string_map: Dict[str, str] = {}
         self.functions: Dict[str, Dict[str, Any]] = {}
         self.warnings: List[str] = []
+        self.errors: List[str] = []  # Track compilation errors
         self.last_assembly: str = ""
         self.variables: Dict[str, int] = {}
         self.const_variables: set = set()
@@ -5299,36 +5404,75 @@ class CppCompiler:
         # Array support
         self.arrays: Dict[str, Dict[str, Any]] = {}
         self.array_base_addr = 0x2000  # Base address for array storage
+        # Performance optimization
+        self._expression_cache: Dict[str, Any] = {}  # Cache parsed expressions
+        self._temp_register_stack: List[str] = []  # Track temp register usage
+        # Debug support
+        self.current_line: int = 0  # Track current line for error reporting
+        self.source_lines: List[str] = []  # Store source for error context
+        # Statistics
+        self.stats = {
+            "expressions_cached": 0,
+            "registers_reused": 0,
+            "optimizations_applied": 0
+        }
 
     PROGRAM_BASE = 0x1000
 
     def compile(self, code: str) -> bytes:
         self.reset()
-        cleaned = self._strip_comments(code)
-        cleaned = self._remove_includes(cleaned)
         
-        # Extract and process class definitions before main
-        cleaned = self._extract_and_process_classes(cleaned)
+        # Store source lines for error reporting
+        self.source_lines = code.split('\n')
         
-        body = self._extract_main_body(cleaned)
-        statements = self._split_statements(body)
-        assembly_lines = [
-            "; Generated by cas++ compiler",
-            f".org 0x{self.PROGRAM_BASE:04x}",
-            "main:"
-        ]
-        has_return = False
-        for stmt in statements:
-            stmt = stmt.strip()
-            if not stmt:
-                continue
-            translated, returns = self._translate_statement(stmt)
-            assembly_lines.extend(translated)
-            if returns:
-                has_return = True
-        if not has_return:
-            assembly_lines.append("    LOADI R0, 0")
-        assembly_lines.append("    HALT")
+        try:
+            cleaned = self._strip_comments(code)
+            cleaned = self._remove_includes(cleaned)
+            
+            # Extract and process class definitions before main
+            cleaned = self._extract_and_process_classes(cleaned)
+            
+            body = self._extract_main_body(cleaned)
+            statements = self._split_statements(body)
+            
+            assembly_lines = [
+                "; Generated by cas++ compiler",
+                f".org 0x{self.PROGRAM_BASE:04x}",
+                "main:"
+            ]
+            
+            has_return = False
+            for i, stmt in enumerate(statements):
+                stmt = stmt.strip()
+                if not stmt:
+                    continue
+                
+                self.current_line = i + 1  # Track line for error reporting
+                
+                try:
+                    translated, returns = self._translate_statement(stmt)
+                    assembly_lines.extend(translated)
+                    if returns:
+                        has_return = True
+                except CppCompilerError as e:
+                    # Add line context to error
+                    self.errors.append(f"Line {self.current_line}: {e}")
+                    # Continue to find more errors
+                    
+            # Check if we had any errors
+            if self.errors:
+                error_msg = "Compilation failed with errors:\n" + "\n".join(self.errors)
+                raise CppCompilerError(error_msg)
+            
+            if not has_return:
+                assembly_lines.append("    LOADI R0, 0")
+            assembly_lines.append("    HALT")
+            
+        except CppCompilerError:
+            raise  # Re-raise compiler errors
+        except Exception as e:
+            # Catch unexpected errors and provide context
+            raise CppCompilerError(f"Unexpected error at line {self.current_line}: {e}") from e
         if self.string_literals:
             assembly_lines.append("")
             assembly_lines.append("; --- cas++ string literals ---")
@@ -5348,6 +5492,20 @@ class CppCompiler:
 
     def get_assembly_output(self) -> str:
         return self.last_assembly
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get compilation statistics"""
+        return {
+            "expressions_cached": self.stats["expressions_cached"],
+            "registers_reused": self.stats["registers_reused"],
+            "optimizations_applied": self.stats["optimizations_applied"],
+            "variables": len(self.variables),
+            "string_literals": len(self.string_literals),
+            "warnings": len(self.warnings),
+            "errors": len(self.errors),
+            "arrays": len(self.arrays),
+            "classes": len(self.class_definitions)
+        }
 
     def _remove_includes(self, code: str) -> str:
         lines = []
@@ -5719,41 +5877,120 @@ class CppCompiler:
         return [], False
 
     def _translate_printf(self, stmt: str) -> List[str]:
-        match = re.match(r'printf\s*\(\s*(.+)\s*\)\s*$', stmt)
+        # Remove trailing semicolon if present
+        stmt = stmt.rstrip(';').strip()
+        
+        # More flexible regex to handle various printf formats
+        match = re.match(r'printf\s*\((.+)\)$', stmt, re.DOTALL)
         if not match:
-            raise CppCompilerError(f"Unable to parse printf statement: {stmt}")
+            # Try to provide helpful error message
+            if 'printf' in stmt and '(' in stmt:
+                raise CppCompilerError(f"Malformed printf statement - check parentheses: {stmt[:50]}...")
+            raise CppCompilerError(f"Unable to parse printf statement: {stmt[:50]}...")
+        
         argument = match.group(1).strip()
-        literal_token, remainder = self._split_string_literal(argument)
+        
+        try:
+            literal_token, remainder = self._split_string_literal(argument)
+        except CppCompilerError as e:
+            raise CppCompilerError(f"Error parsing printf string literal: {e}")
         try:
             text_value = ast.literal_eval(literal_token)
         except Exception as exc:
             raise CppCompilerError(f"Invalid string literal in printf: {exc}") from exc
+        
+        lines = ["    ; printf"]
         remainder = remainder.strip()
+        
         if remainder:
             if not remainder.startswith(","):
                 raise CppCompilerError("printf arguments must be separated by commas")
             extra_args = self._split_arguments(remainder[1:].strip())
-            try:
-                values = [self._evaluate_expression(arg) for arg in extra_args if arg]
-            except CppCompilerError:
-                # Dynamic printf arguments are not evaluated at compile time; print literal only.
-                self.warnings.append("printf with non-constant arguments prints literal only (no %d substitution)")
-                values = []
-            for value in values:
-                if "%d" in text_value:
-                    text_value = text_value.replace("%d", str(value), 1)
-                else:
-                    text_value = f"{text_value}{value}"
-        label = self._add_string_literal(text_value)
-        length = len(text_value.encode('utf-8'))
-        return [
-            "    ; printf",
-            "    LOADI R0, 1",
-            "    LOADI R1, 1",
-            f"    LOADI R2, {label}",
-            f"    LOADI R3, {length}",
-            "    SYSCALL R0"
-        ]
+            
+            # Try to evaluate as constants first
+            const_values = []
+            dynamic_args = []
+            for arg in extra_args:
+                if not arg:
+                    continue
+                try:
+                    val = self._evaluate_expression(arg)
+                    const_values.append(val)
+                    dynamic_args.append(None)
+                except CppCompilerError:
+                    # It's a variable/expression - handle at runtime
+                    const_values.append(None)
+                    dynamic_args.append(arg)
+            
+            # If all arguments are constants, do compile-time substitution
+            if all(v is not None for v in const_values):
+                for value in const_values:
+                    if "%d" in text_value:
+                        text_value = text_value.replace("%d", str(value), 1)
+                    else:
+                        text_value = f"{text_value}{value}"
+                label = self._add_string_literal(text_value)
+                length = len(text_value.encode('utf-8'))
+                lines.extend([
+                    "    LOADI R0, 1",
+                    "    LOADI R1, 1",
+                    f"    LOADI R2, {label}",
+                    f"    LOADI R3, {length}",
+                    "    SYSCALL R0"
+                ])
+            else:
+                # Handle runtime substitution by splitting format string and printing parts
+                parts = text_value.split("%d")
+                arg_idx = 0
+                
+                for i, part in enumerate(parts):
+                    # Print the string part
+                    if part:
+                        label = self._add_string_literal(part)
+                        length = len(part.encode('utf-8'))
+                        lines.extend([
+                            "    LOADI R0, 1",
+                            "    LOADI R1, 1",
+                            f"    LOADI R2, {label}",
+                            f"    LOADI R3, {length}",
+                            "    SYSCALL R0"
+                        ])
+                    
+                    # Print the variable (if not last part)
+                    if i < len(parts) - 1 and arg_idx < len(dynamic_args):
+                        if dynamic_args[arg_idx] is not None:
+                            # Evaluate expression into a register
+                            node = self._parse_expression_node(dynamic_args[arg_idx])
+                            temp_reg = self._acquire_temp_register()
+                            lines.extend(self._emit_expression_to_register(node, temp_reg))
+                            # Print integer syscall (syscall 50)
+                            lines.extend([
+                                "    LOADI R0, 50",
+                                f"    MOV R1, {temp_reg}",
+                                "    SYSCALL R0"
+                            ])
+                            self._release_temp_register(temp_reg)
+                        elif const_values[arg_idx] is not None:
+                            # Print constant
+                            lines.extend([
+                                "    LOADI R0, 50",
+                                f"    LOADI R1, {const_values[arg_idx]}",
+                                "    SYSCALL R0"
+                            ])
+                        arg_idx += 1
+        else:
+            # No arguments, just print the string
+            label = self._add_string_literal(text_value)
+            length = len(text_value.encode('utf-8'))
+            lines.extend([
+                "    LOADI R0, 1",
+                "    LOADI R1, 1",
+                f"    LOADI R2, {label}",
+                f"    LOADI R3, {length}",
+                "    SYSCALL R0"
+            ])
+        
+        return lines
 
     def _translate_return(self, stmt: str) -> List[str]:
         expr = stmt[len("return"):].strip()
@@ -6099,9 +6336,17 @@ class CppCompiler:
         return args
 
     def _parse_expression_node(self, expr: str):
+        # Check cache first for performance
+        if expr in self._expression_cache:
+            self.stats["expressions_cached"] += 1
+            return self._expression_cache[expr]
+        
         expr = self._normalize_expression(expr)
         try:
-            return ast.parse(expr, mode="eval").body
+            node = ast.parse(expr, mode="eval").body
+            # Cache the parsed expression
+            self._expression_cache[expr] = node
+            return node
         except SyntaxError as exc:
             raise CppCompilerError(f"Invalid expression '{expr}': {exc}")
 
@@ -6318,10 +6563,22 @@ class CppCompiler:
     def _acquire_temp_register(self) -> str:
         if not self.temp_register_pool:
             raise CppCompilerError("Out of temporary registers for expression evaluation")
-        return self.temp_register_pool.pop()
+        reg = self.temp_register_pool.pop()
+        self._temp_register_stack.append(reg)
+        return reg
 
     def _release_temp_register(self, reg: str):
+        if reg in self._temp_register_stack:
+            self._temp_register_stack.remove(reg)
+            self.stats["registers_reused"] += 1
         self.temp_register_pool.append(reg)
+    
+    def _release_all_temp_registers(self):
+        """Release all temp registers - useful for cleanup"""
+        while self._temp_register_stack:
+            reg = self._temp_register_stack.pop()
+            if reg not in self.temp_register_pool:
+                self.temp_register_pool.append(reg)
 
     def _emit_load_immediate(self, target: str, value: int) -> List[str]:
         # Handle values that fit in 16-bit signed
@@ -6573,6 +6830,27 @@ class CppCompiler:
                 code.extend(self._emit_expression_to_register(node.args[0], target))
                 code.append(f"    STRLEN {target}, {target}")
                 return code
+            if fname == "abs" and len(node.args) == 1:
+                # abs(x) -> absolute value
+                code.extend(self._emit_expression_to_register(node.args[0], target))
+                code.append(f"    ABS {target}, {target}")
+                return code
+            if fname == "min" and len(node.args) == 2:
+                # min(a, b) -> minimum of two values
+                code.extend(self._emit_expression_to_register(node.args[0], target))
+                b_reg = self._acquire_temp_register()
+                code.extend(self._emit_expression_to_register(node.args[1], b_reg))
+                code.append(f"    MIN {target}, {b_reg}")
+                self._release_temp_register(b_reg)
+                return code
+            if fname == "max" and len(node.args) == 2:
+                # max(a, b) -> maximum of two values
+                code.extend(self._emit_expression_to_register(node.args[0], target))
+                b_reg = self._acquire_temp_register()
+                code.extend(self._emit_expression_to_register(node.args[1], b_reg))
+                code.append(f"    MAX {target}, {b_reg}")
+                self._release_temp_register(b_reg)
+                return code
             if fname == "memset" and len(node.args) == 3:
                 # memset(addr, value, count) -> MEMSET
                 addr_reg = self._acquire_temp_register()
@@ -6616,6 +6894,47 @@ class CppCompiler:
                 # saturate(x) -> clamp to 0-255 (useful for colors)
                 code.extend(self._emit_expression_to_register(node.args[0], target))
                 code.append(f"    SATURATE {target}")
+                return code
+            # Math functions
+            if fname == "sqrt" and len(node.args) == 1:
+                # sqrt(x) -> square root
+                code.extend(self._emit_expression_to_register(node.args[0], target))
+                code.append(f"    SQRT {target}, {target}")
+                return code
+            if fname == "pow" and len(node.args) == 2:
+                # pow(base, exp) -> power
+                code.extend(self._emit_expression_to_register(node.args[0], target))
+                exp_reg = self._acquire_temp_register()
+                code.extend(self._emit_expression_to_register(node.args[1], exp_reg))
+                code.append(f"    POW {target}, {exp_reg}")
+                self._release_temp_register(exp_reg)
+                return code
+            if fname == "rand" and len(node.args) == 0:
+                # rand() -> random number
+                code.append(f"    RANDOM {target}, R0")
+                return code
+            if fname == "srand" and len(node.args) == 1:
+                # srand(seed) -> set random seed
+                seed_reg = self._acquire_temp_register()
+                code.extend(self._emit_expression_to_register(node.args[0], seed_reg))
+                code.append(f"    SETSEED {seed_reg}, R0")
+                code.append(f"    LOADI {target}, 0")
+                self._release_temp_register(seed_reg)
+                return code
+            if fname == "popcnt" and len(node.args) == 1:
+                # popcnt(x) -> count set bits
+                code.extend(self._emit_expression_to_register(node.args[0], target))
+                code.append(f"    POPCNT {target}, {target}")
+                return code
+            if fname == "clz" and len(node.args) == 1:
+                # clz(x) -> count leading zeros
+                code.extend(self._emit_expression_to_register(node.args[0], target))
+                code.append(f"    LZCNT {target}, {target}")
+                return code
+            if fname == "ctz" and len(node.args) == 1:
+                # ctz(x) -> count trailing zeros
+                code.extend(self._emit_expression_to_register(node.args[0], target))
+                code.append(f"    TZCNT {target}, {target}")
                 return code
             # String and comparison utilities
             if fname == "strcmp" and len(node.args) == 2:
@@ -7690,14 +8009,15 @@ class Shell:
     def do_caspp(self, args):
         """Compile C++ code using the cas++ compiler"""
         if not args:
-            print("Usage: cas++ <source.cpp> [output.bin] [--run] [--asm] [--debug]")
+            print("Usage: cas++ <source.cpp> [output.bin] [--run] [--asm] [--debug] [--output]")
             return
         run_after = "--run" in args
         show_asm = "--asm" in args
         debug_mode = "--debug" in args
+        output_only = "--output" in args
         positional = [arg for arg in args if not arg.startswith("--")]
         if not positional:
-            print("Usage: cas++ <source.cpp> [output.bin] [--run] [--asm] [--debug]")
+            print("Usage: cas++ <source.cpp> [output.bin] [--run] [--asm] [--debug] [--output]")
             return
         src = positional[0]
         out_file = positional[1] if len(positional) > 1 else self._default_cpp_output(src)
@@ -7712,23 +8032,39 @@ class Shell:
             print(f"cas++ error: {exc}")
             return
         abs_out = self.kernel.write_file(out_file, binary, 0o755, self.kernel.cwd)
-        statement_count = compiler.functions.get("main", {}).get("statements", 0)
-        print(f"✓ cas++ compiled {abs_src} -> {abs_out} ({len(binary)} bytes)")
-        print(f"  Statements: {statement_count}")
-        print(f"  String literals: {len(compiler.string_literals)}")
-        if compiler.includes:
-            print(f"  Includes: {' '.join(compiler.includes)}")
-        if compiler.warnings:
-            print("Warnings:")
-            for warn in compiler.warnings:
-                print(f"  - {warn}")
-        if show_asm or debug_mode:
-            print("\nGenerated Assembly:")
-            print("=" * 60)
-            print(compiler.get_assembly_output())
-            print("=" * 60)
+        
+        # If --output flag is set, suppress all compilation info
+        if not output_only:
+            statement_count = compiler.functions.get("main", {}).get("statements", 0)
+            stats = compiler.get_stats()
+            
+            print(f"✓ cas++ compiled {abs_src} -> {abs_out} ({len(binary)} bytes)")
+            print(f"  Statements: {statement_count}")
+            print(f"  Variables: {stats['variables']}, Arrays: {stats['arrays']}, Classes: {stats['classes']}")
+            print(f"  String literals: {stats['string_literals']}")
+            
+            # Show performance stats if optimizations were used
+            if stats['expressions_cached'] > 0 or stats['registers_reused'] > 0:
+                print(f"  Performance: {stats['expressions_cached']} cached, {stats['registers_reused']} reused")
+            
+            if compiler.includes:
+                print(f"  Includes: {' '.join(compiler.includes)}")
+            if compiler.warnings:
+                print("Warnings:")
+                for warn in compiler.warnings:
+                    print(f"  - {warn}")
+            if show_asm or debug_mode:
+                print("\nGenerated Assembly:")
+                print("=" * 60)
+                print(compiler.get_assembly_output())
+                print("=" * 60)
+        
         if run_after:
-            self.do_run([out_file])
+            # Pass --output flag to run command if set
+            run_args = [out_file]
+            if output_only:
+                run_args.append("--output")
+            self.do_run(run_args)
     
     def do_cpp_help(self, args):
         """Show C++ compiler help"""
@@ -7741,6 +8077,7 @@ class Shell:
         print("  --run     Compile and immediately execute the program")
         print("  --asm     Display generated assembly output")
         print("  --debug   Alias for --asm (kept for compatibility)")
+        print("  --output  Show ONLY program output (no debug info)")
         print()
         print("OTHER COMMANDS:")
         print("  compilecpp  - Alias for cas++")
@@ -7749,12 +8086,34 @@ class Shell:
         print()
         print("SUPPORTED FEATURES:")
         print("  • #include lines (ignored but accepted for common headers)")
-        print("  • int / const int declarations with constant expressions")
-        print("  • Mutable int variables mapped to CPU registers (R4-R8)")
-        print("  • Arithmetic expressions using +, -, *, /, % and parentheses")
-        print("  • Assignments to previously declared integers")
+        print("  • int / const int / float / bool / char declarations")
+        print("  • Mutable variables mapped to CPU registers (R4-R12)")
+        print("  • Arithmetic: +, -, *, /, %, ++, --, +=, -=, *=, /=")
+        print("  • Bitwise: &, |, ^, ~, <<, >>, &=, |=, ^=, <<=, >>=")
+        print("  • Comparison: ==, !=, <, >, <=, >=")
+        print("  • Control flow: if/else, while, do-while, for, break, continue")
+        print("  • Arrays: int arr[size]; with indexing arr[i]")
+        print("  • Classes: Basic class support with members")
+        print()
+        print("BUILT-IN FUNCTIONS:")
+        print("  Math: abs(), min(), max(), sqrt(), pow(), rand(), srand()")
+        print("  String: strlen(), strcmp(), memset()")
+        print("  Bitwise: popcnt(), clz(), ctz(), swap(), reverse()")
+        print("  Graphics: lerp(), sign(), saturate(), clamp()")
+        print("  System: gettime(), sleep()")
         print("  • printf(\"text\", value1, value2, ...); with %d placeholders")
         print("  • return <expression>; (integers & simple arithmetic)")
+        print()
+        print("NEW CPU INSTRUCTIONS:")
+        print("  • MULH  - Multiply High (upper 32 bits of 64-bit result)")
+        print("  • DIVMOD - Combined division and modulo")
+        print("  • AVGB  - Average of two values (useful for blending)")
+        print()
+        print("OPTIMIZATIONS:")
+        print("  • Expression caching for faster compilation")
+        print("  • Register reuse optimization")
+        print("  • Peephole optimization in assembler")
+        print()
         print("Unsupported statements are ignored with warnings.")
     
     def do_compile_cpp(self, args):
@@ -7831,6 +8190,7 @@ class Shell:
         # Parse flags
         debug_mode = "--debug" in args
         output_mode = "--output" in args
+        output_only = output_mode  # --output means show ONLY program output
         trace_mode = "--trace" in args
         
         # Remove flags from args
@@ -7865,19 +8225,21 @@ class Shell:
         self.cpu.program_start = addr
         self.cpu.program_end = addr + len(data)
         
-        if debug_mode:
-            print(f"=== DEBUG MODE ===")
-            print(f"File: {abs_path}")
-            print(f"Load Address: {addr:08x}")
-            print(f"Size: {len(data)} bytes")
-            print(f"Initial PC: {self.cpu.pc:08x}")
-            print(f"Initial SP: {self.cpu.reg_read(REG_SP):08x}")
-            print("=" * 50)
-        else:
-            print(f"Executing {abs_path} at {addr:08x} (size {len(data)} bytes).")
-        
-        # Print separator for program output
-        print("\n--- Program Output ---")
+        # --output mode: ONLY show program output, nothing else
+        if not output_only:
+            if debug_mode:
+                print(f"=== DEBUG MODE ===")
+                print(f"File: {abs_path}")
+                print(f"Load Address: {addr:08x}")
+                print(f"Size: {len(data)} bytes")
+                print(f"Initial PC: {self.cpu.pc:08x}")
+                print(f"Initial SP: {self.cpu.reg_read(REG_SP):08x}")
+                print("=" * 50)
+            else:
+                print(f"Executing {abs_path} at {addr:08x} (size {len(data)} bytes).")
+            
+            # Print separator for program output
+            print("\n--- Program Output ---")
         
         try:
             # Add max_steps to prevent infinite loops (10 million instructions)
@@ -7886,47 +8248,52 @@ class Shell:
             steps = self.cpu.run(max_steps=10_000_000, trace=trace_mode)
             elapsed = time.time() - start_time
             
-            # Add newline after program output and show execution stats
-            print("\n--- Execution Statistics ---")
-            print(f"Executed {steps:,} instructions in {elapsed:.4f}s ({steps/elapsed if elapsed > 0 else 0:,.0f} inst/sec)")
-            
-            if steps >= 10_000_000:
-                print(f"WARNING: Program reached maximum instruction limit ({steps:,} steps)")
+            # Show execution stats only if not in output-only mode
+            if not output_only:
+                # Add newline after program output and show execution stats
+                print("\n--- Execution Statistics ---")
+                print(f"Executed {steps:,} instructions in {elapsed:.4f}s ({steps/elapsed if elapsed > 0 else 0:,.0f} inst/sec)")
+                
+                if steps >= 10_000_000:
+                    print(f"WARNING: Program reached maximum instruction limit ({steps:,} steps)")
         except Exception as e:
-            print("\n--- Execution Error ---")
-            print("Execution error:", e)
-            if debug_mode:
-                import traceback
-                traceback.print_exc()
+            if not output_only:
+                print("\n--- Execution Error ---")
+                print("Execution error:", e)
+                if debug_mode:
+                    import traceback
+                    traceback.print_exc()
         
-        # Show key register values after execution
-        print("\n--- Final State ---")
-        r0 = self.cpu.reg_read(0)
-        r1 = self.cpu.reg_read(1)
-        r2 = self.cpu.reg_read(2)
-        print(f"Key registers: R0={r0}, R1={r1}, R2={r2}")
-        print(f"Program exit code (R0): {r0}")
+        # Show key register values after execution (skip in output-only mode)
+        if not output_only:
+            print("\n--- Final State ---")
+            r0 = self.cpu.reg_read(0)
+            r1 = self.cpu.reg_read(1)
+            r2 = self.cpu.reg_read(2)
+            print(f"Key registers: R0={r0}, R1={r1}, R2={r2}")
+            print(f"Program exit code (R0): {r0}")
+            
+            # Show output mode results
+            if output_mode or debug_mode:
+                print("\n=== EXECUTION RESULTS ===")
+                print(f"Final PC: {self.cpu.pc:08x}")
+                print(f"Final SP: {self.cpu.reg_read(REG_SP):08x}")
+                print(f"Flags: {self.cpu.flags:08x}")
+                print("\nRegister Changes:")
+                for i in range(NUM_REGS):
+                    final_val = self.cpu.reg_read(i)
+                    if output_mode or (debug_mode and final_val != initial_regs[i]):
+                        print(f"  R{i}: {initial_regs[i]:08x} -> {final_val:08x}")
+                print("=" * 50)
+            
+            # Check if it was a reboot signal
+            if self.cpu.reg_read(0) == 0xDEADBEEF:
+                print("\n[Reboot signal received]")
+                return 0xDEADBEEF
+            else:
+                print("\n[Program finished]")
         
-        # Show output mode results
-        if output_mode or debug_mode:
-            print("\n=== EXECUTION RESULTS ===")
-            print(f"Final PC: {self.cpu.pc:08x}")
-            print(f"Final SP: {self.cpu.reg_read(REG_SP):08x}")
-            print(f"Flags: {self.cpu.flags:08x}")
-            print("\nRegister Changes:")
-            for i in range(NUM_REGS):
-                final_val = self.cpu.reg_read(i)
-                if output_mode or (debug_mode and final_val != initial_regs[i]):
-                    print(f"  R{i}: {initial_regs[i]:08x} -> {final_val:08x}")
-            print("=" * 50)
-        
-        # Check if it was a reboot signal
-        if self.cpu.reg_read(0) == 0xDEADBEEF:
-            print("\n[Reboot signal received]")
-            return 0xDEADBEEF
-        else:
-            print("\n[Program finished]")
-            return 0
+        return 0
     
     def do_runmt(self, args):
         """Run program with multithreading support"""
