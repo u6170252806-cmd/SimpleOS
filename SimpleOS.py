@@ -1477,6 +1477,10 @@ class Kernel:
     42: WGET (url_addr) -> simulate wget command
     43: GREP (pattern_addr, file_addr) -> search within file
     44: WC (file_addr) -> count lines, words, characters in a file
+    45: INPUT (buf_addr, max_len) -> read string line from stdin into buffer
+    46: INPUT_INT () -> read integer from stdin into R0
+    47-49: Reserved for future use
+    50: PRINT_INT (value) -> print integer directly to stdout
     """
     def __init__(self, username: str = "guest"):
         self.files: Dict[str, Dict[str, Any]] = {}  # filename -> {data, permissions, created_time, modified_time}
@@ -1768,19 +1772,22 @@ class Kernel:
                 cpu.reg_write(0, length)
             else:
                 cpu.reg_write(0, 0)
-        elif num == 2:  # READ(fd, buf_addr, len)
+        elif num == 2:  # READ(fd, buf_addr, len) - Reads from stdin (ENHANCED for line input)
             fd = a1
             addr = a2
             length = a3
             if fd == 0:
-                # blocking read from stdin up to length bytes
-                s = sys.stdin.read(1)  # keep simple: read one char
-                if s == "":
+                # Read a full line from stdin (enhanced for interactive input)
+                try:
+                    line = input()  # Reads full line including user typing
+                    line_bytes = line.encode("utf-8")[:length-1]  # Leave room for null terminator
+                    cpu.mem.load_bytes(addr, line_bytes + b'\x00')
+                    cpu.reg_write(0, len(line_bytes))
+                except EOFError:
+                    cpu.mem.write_byte(addr, 0)  # Write null terminator
                     cpu.reg_write(0, 0)
-                else:
-                    b = s.encode("utf-8")[0]
-                    cpu.mem.write_byte(addr, b)
-                    cpu.reg_write(0, 1)
+                except Exception:
+                    cpu.reg_write(0, 0)
             else:
                 cpu.reg_write(0, 0)
         elif num == 3:  # LIST_DIR(dir_addr, out_addr)
@@ -2123,6 +2130,32 @@ class Kernel:
             cpu.reg_write(0, lines & 0xFFFFFFFF)
             cpu.reg_write(1, words & 0xFFFFFFFF)
             cpu.reg_write(2, chars & 0xFFFFFFFF)
+        elif num == 45:  # INPUT (buf_addr, max_len) - Read string from stdin
+            buf_addr = a1
+            max_len = a2 if a2 > 0 else 256
+            try:
+                user_input = input()  # Read full line from stdin
+                input_bytes = user_input.encode('utf-8')[:max_len-1]  # Leave room for null terminator
+                cpu.mem.load_bytes(buf_addr, input_bytes + b'\x00')
+                cpu.reg_write(0, len(input_bytes))  # Return length read
+            except EOFError:
+                cpu.mem.write_byte(buf_addr, 0)  # Write null terminator
+                cpu.reg_write(0, 0)
+            except Exception:
+                cpu.reg_write(0, 0)
+        elif num == 46:  # INPUT_INT - Read integer from stdin
+            try:
+                user_input = input().strip()
+                # Support decimal and hex (0x123)
+                if user_input.startswith('0x') or user_input.startswith('0X'):
+                    value = int(user_input, 16)
+                else:
+                    value = int(user_input)
+                cpu.reg_write(0, value & 0xFFFFFFFF)
+            except (ValueError, EOFError):
+                cpu.reg_write(0, 0)  # Return 0 on error
+            except Exception:
+                cpu.reg_write(0, 0)
         elif num == 50:  # PRINT_INT - Print integer to stdout
             value = a1
             # Convert to signed 32-bit integer
@@ -4988,8 +5021,24 @@ class Assembler:
             line = raw.split(';',1)[0].strip()
             if not line:
                 continue
-            if ':' in line:
-                line = line.split(':',1)[1].strip()
+            # Check for label, but only if ':' is NOT inside a string
+            if ':' in line and not line.startswith('.'):
+                # Find ':' that is not inside quotes
+                in_string = False
+                escape = False
+                for idx, ch in enumerate(line):
+                    if escape:
+                        escape = False
+                        continue
+                    if ch == '\\':
+                        escape = True
+                        continue
+                    if ch == '"':
+                        in_string = not in_string
+                        continue
+                    if ch == ':' and not in_string:
+                        line = line[idx+1:].strip()
+                        break
                 if not line:
                     continue
             if line.startswith('.'):
@@ -5728,7 +5777,8 @@ class CppCompiler:
             return incdec_code, False
         if stmt.startswith("class "):
             return self._compile_class_definition(stmt), False
-        if stmt.startswith("printf"):
+        # Match printf( at word boundary, not printf_int or other variants
+        if re.match(r'^printf\s*\(', stmt):
             return self._translate_printf(stmt), False
         if stmt.startswith("return"):
             return self._translate_return(stmt), True
@@ -5777,6 +5827,17 @@ class CppCompiler:
                 treg = self._acquire_temp_register()
                 lines.extend(self._emit_expression_to_register(node, treg))
                 lines.append(f"    SLEEP R0, {treg}")  # Two operand form
+                self._release_temp_register(treg)
+                return lines, False
+            
+            # printf_int(value) - print integer directly using syscall 50
+            if name == "printf_int" and len(args) == 1:
+                node = self._parse_expression_node(args[0])
+                treg = self._acquire_temp_register()
+                lines.extend(self._emit_expression_to_register(node, treg))
+                lines.append(f"    LOADI R0, 50  ; PRINT_INT syscall")
+                lines.append(f"    MOV R1, {treg}")
+                lines.append(f"    SYSCALL R0")
                 self._release_temp_register(treg)
                 return lines, False
             
@@ -5877,16 +5938,17 @@ class CppCompiler:
         return [], False
 
     def _translate_printf(self, stmt: str) -> List[str]:
-        # Remove trailing semicolon if present
+        # Remove trailing semicolon if present - CAREFUL: check quotes first
         stmt = stmt.rstrip(';').strip()
         
         # More flexible regex to handle various printf formats
+        # Support both printf(...) and printf(...); forms
         match = re.match(r'printf\s*\((.+)\)$', stmt, re.DOTALL)
         if not match:
             # Try to provide helpful error message
             if 'printf' in stmt and '(' in stmt:
-                raise CppCompilerError(f"Malformed printf statement - check parentheses: {stmt[:50]}...")
-            raise CppCompilerError(f"Unable to parse printf statement: {stmt[:50]}...")
+                raise CppCompilerError(f"Malformed printf statement - check parentheses and matching quotes: {stmt[:80]}...")
+            raise CppCompilerError(f"Unable to parse printf statement: {stmt[:80]}...")
         
         argument = match.group(1).strip()
         
@@ -6284,20 +6346,29 @@ class CppCompiler:
         return f"\"{escaped}\""
     
     def _split_string_literal(self, argument: str) -> Tuple[str, str]:
+        """Extract first string literal from argument.
+        
+        Carefully handles escape sequences: \\n, \\t, \\\\, \\\", etc.
+        Returns (quoted_string, remainder_after_quote)
+        """
         if not argument.startswith('"'):
             raise CppCompilerError("printf requires a string literal as the first argument")
         escape = False
         for idx in range(1, len(argument)):
             ch = argument[idx]
             if escape:
+                # After backslash, accept any character
                 escape = False
                 continue
             if ch == '\\':
+                # Start of escape sequence
                 escape = True
                 continue
             if ch == '"':
+                # Found closing quote - return the quoted string and remainder
                 return argument[:idx + 1], argument[idx + 1:]
-        raise CppCompilerError("Unterminated string literal in printf")
+        # If we get here, the quote was never closed
+        raise CppCompilerError(f"Unterminated string literal in printf - check for unescaped quotes: {argument[:60]}...")
 
     def _split_arguments(self, arg_string: str) -> List[str]:
         args = []
@@ -6806,6 +6877,24 @@ class CppCompiler:
                 code.append(f"    SLEEP R0, {src_reg}")
                 code.append(f"    LOADI {target}, 0")  # Return 0
                 self._release_temp_register(src_reg)
+                return code
+            # Input/Output functions for interactive programs
+            if fname == "get_input" and len(node.args) == 0:
+                # get_input() -> syscall 46 (INPUT_INT) - read integer from stdin
+                code.append(f"    LOADI R0, 46  ; INPUT_INT syscall")
+                code.append(f"    SYSCALL R0")
+                code.append(f"    MOV {target}, R0")
+                return code
+            if fname == "get_string" and len(node.args) == 1:
+                # get_string(buf_addr) -> syscall 45 (INPUT) - read string from stdin
+                buf_reg = self._acquire_temp_register()
+                code.extend(self._emit_expression_to_register(node.args[0], buf_reg))
+                code.append(f"    LOADI R0, 45  ; INPUT syscall")
+                code.append(f"    MOV R1, {buf_reg}")
+                code.append(f"    LOADI R2, 256  ; max length")
+                code.append(f"    SYSCALL R0")
+                code.append(f"    MOV {target}, R0  ; Return length read")
+                self._release_temp_register(buf_reg)
                 return code
             if fname == "gettime" and len(node.args) == 0:
                 # gettime() -> GETTIME target, R0 (two operand form)
