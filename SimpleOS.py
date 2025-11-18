@@ -398,6 +398,8 @@ OP_SLEEP = 0x106
 OP_YIELD = 0x107
 OP_BARRIER = 0x108
 OP_MEMSCRUB = 0x150
+OP_MEMCHR = 0x200
+OP_REV_MEM = 0x201
 OP_ADDI = 0x151
 OP_SUBI = 0x152
 OP_MULI = 0x153
@@ -467,6 +469,7 @@ OPCODE_NAME = {
     OP_PREFETCH: "PREFETCH", OP_CLFLUSH: "CLFLUSH", OP_MFENCE: "MFENCE", OP_LFENCE: "LFENCE", OP_SFENCE: "SFENCE",
     OP_STRCPY: "STRCPY", OP_STRCAT: "STRCAT", OP_STRNCPY: "STRNCPY", OP_STRNCAT: "STRNCAT", OP_STRCHR: "STRCHR", OP_STRSTR: "STRSTR",
     OP_ATOI: "ATOI", OP_ITOA: "ITOA", OP_FTOI: "FTOI", OP_ITOF: "ITOF",
+    OP_MEMCHR: "MEMCHR", OP_REV_MEM: "REV_MEM",
     OP_CMPS: "CMPS", OP_SCAS: "SCAS",
     OP_XADD: "XADD", OP_XCHG_MEM: "XCHG_MEM",
     OP_SETA: "SETA", OP_SETB: "SETB", OP_SETBE: "SETBE", OP_SETAE: "SETAE", OP_SETO: "SETO", OP_SETNO: "SETNO",
@@ -3741,6 +3744,32 @@ class CPU:
             for i in range(length):
                 byte = self.mem.read_byte((src_addr + i) & 0xFFFFFFFF)
                 self.mem.write_byte((dst_addr + i) & 0xFFFFFFFF, byte)
+        elif opcode == OP_MEMCHR:
+            # MEMCHR: R0=base_addr, R1=value(byte), R2=length -> R0=result_addr or 0
+            base = self.reg_read(0) & 0xFFFFFFFF
+            val = self.reg_read(1) & 0xFF
+            length = self.reg_read(2) & 0xFFFFFFFF
+            found = 0
+            for i in range(length):
+                b = self.mem.read_byte((base + i) & 0xFFFFFFFF)
+                if b == val:
+                    found = (base + i) & 0xFFFFFFFF
+                    break
+            self.reg_write(0, found)
+        elif opcode == OP_REV_MEM:
+            # REV_MEM: R0=base_addr, R1=length -> reverse bytes in-place
+            base = self.reg_read(0) & 0xFFFFFFFF
+            length = self.reg_read(1) & 0xFFFFFFFF
+            if length > 0:
+                i = 0
+                j = length - 1
+                while i < j:
+                    a = self.mem.read_byte((base + i) & 0xFFFFFFFF)
+                    b = self.mem.read_byte((base + j) & 0xFFFFFFFF)
+                    self.mem.write_byte((base + i) & 0xFFFFFFFF, b)
+                    self.mem.write_byte((base + j) & 0xFFFFFFFF, a)
+                    i += 1
+                    j -= 1
         elif opcode == OP_MEMSET:
             # Memory set: R0=dst_addr, R1=value, R2=length
             dst_addr = self.reg_read(0) & 0xFFFFFFFF
@@ -5459,6 +5488,8 @@ class CppCompiler:
         # Debug support
         self.current_line: int = 0  # Track current line for error reporting
         self.source_lines: List[str] = []  # Store source for error context
+        self.debug_enabled: bool = False  # When True, emit extra debug logging
+        self.debug_messages: List[str] = []
         # Statistics
         self.stats = {
             "expressions_cached": 0,
@@ -5468,7 +5499,30 @@ class CppCompiler:
 
     PROGRAM_BASE = 0x1000
 
-    def compile(self, code: str) -> bytes:
+    def log(self, message: str, level: str = "DEBUG"):
+        """Record a debug message and optionally emit via logger when enabled."""
+        try:
+            self.debug_messages.append(f"{level}: {message}")
+        except Exception:
+            pass
+        if not getattr(self, "debug_enabled", False):
+            return
+        if level == "DEBUG":
+            logger.debug("cas++: %s", message)
+        elif level == "INFO":
+            logger.info("cas++: %s", message)
+        elif level == "WARN" or level == "WARNING":
+            logger.warning("cas++: %s", message)
+        elif level == "ERROR":
+            logger.error("cas++: %s", message)
+
+    def compile(self, code: str, auto_fix_suggestions: bool = False, save_patch_path: Optional[str] = None) -> bytes:
+        """Compile C++-like source to binary.
+
+        If `auto_fix_suggestions` is True the compiler will automatically apply
+        suggested fixes for likely-typoed function names (e.g. `pritnf` -> `printf`).
+        Otherwise the compiler will prompt interactively when run in a terminal.
+        """
         self.reset()
         
         # Store source lines for error reporting
@@ -5477,7 +5531,10 @@ class CppCompiler:
         try:
             cleaned = self._strip_comments(code)
             cleaned = self._remove_includes(cleaned)
-            
+
+            # Suggest and optionally fix misspelled function names before further processing
+            cleaned = self._suggest_and_fix_misspells(cleaned, auto_fix=auto_fix_suggestions, save_patch_path=save_patch_path)
+
             # Extract and process class definitions before main
             cleaned = self._extract_and_process_classes(cleaned)
             
@@ -5538,6 +5595,71 @@ class CppCompiler:
             binary = binary[self.PROGRAM_BASE:]
         self.functions["main"] = {"statements": len(statements)}
         return binary
+
+    def _suggest_and_fix_misspells(self, src: str, auto_fix: bool = False, save_patch_path: Optional[str] = None) -> str:
+        """Scan source for likely-typoed function calls and suggest fixes.
+
+        If `auto_fix` is True, apply fixes automatically; otherwise prompt the user.
+        Returns possibly modified source.
+        """
+        import re, difflib
+
+        # Known intrinsics and functions we support (expandable)
+        known = set([
+            'printf','printf_int','get_input','get_string','gettime','swap','reverse',
+            'strlen','strcpy','strcat','strncpy','strncat','strstr','strchr','strcmp','memset','lerp','sign',
+            'saturate','pow','rand','srand','popcnt','clz','ctz','rotl','rotr','abs','min','max'
+        ])
+        # Exclude common keywords and entry point
+        keywords = set(['if','for','while','switch','return','int','char','float','double','struct','sizeof','main'])
+
+        pattern = re.compile(r'\b([A-Za-z_]\w*)\s*\(')
+        names = set(m.group(1) for m in pattern.finditer(src))
+        candidates = [n for n in sorted(names) if n not in known and n not in keywords]
+        if not candidates:
+            return src
+
+        original_src = src
+        applied_any = False
+
+        for name in candidates:
+            # Find closest match among known intrinsics
+            matches = difflib.get_close_matches(name, sorted(known), n=1, cutoff=0.7)
+            if not matches:
+                continue
+            suggestion = matches[0]
+            # Prompt or auto-accept
+            prompt = f"Compiler suggestion: Did you mean '{suggestion}' instead of '{name}'? [y/N]: "
+            accept = False
+            if auto_fix:
+                accept = True
+                self.log(f"auto-fix: {name} -> {suggestion}", "INFO")
+            else:
+                try:
+                    resp = input(prompt).strip().lower()
+                    accept = resp == 'y' or resp == 'yes'
+                except Exception:
+                    accept = False
+            if accept:
+                # Replace occurrences of name followed by optional whitespace and '('
+                src = re.sub(rf'\b{re.escape(name)}(\s*)\(', rf'{suggestion}\1(', src)
+                applied_any = True
+                self.log(f"applied_fix: {name} -> {suggestion}", "INFO")
+
+        # If requested, write a unified diff patch file comparing original->modified
+        if applied_any and save_patch_path:
+            try:
+                import difflib
+                from pathlib import Path
+                od = original_src.splitlines(keepends=True)
+                nd = src.splitlines(keepends=True)
+                diff_lines = list(difflib.unified_diff(od, nd, fromfile='original', tofile='fixed'))
+                Path(save_patch_path).write_text(''.join(diff_lines))
+                self.log(f"wrote_patch: {save_patch_path}", "INFO")
+            except Exception as e:
+                self.log(f"failed_write_patch: {e}", "WARN")
+
+        return src
 
     def get_assembly_output(self) -> str:
         return self.last_assembly
@@ -5839,6 +5961,169 @@ class CppCompiler:
                 lines.append(f"    MOV R1, {treg}")
                 lines.append(f"    SYSCALL R0")
                 self._release_temp_register(treg)
+                return lines, False
+
+            # strncpy(dest, src, n) - copy n bytes from src to dest
+            if name == "strncpy" and len(args) == 3:
+                node_dst = self._parse_expression_node(args[0])
+                node_src = self._parse_expression_node(args[1])
+                node_cnt = self._parse_expression_node(args[2])
+                dst_reg = self._acquire_temp_register()
+                src_reg = self._acquire_temp_register()
+                cnt_reg = self._acquire_temp_register()
+                lines.extend(self._emit_expression_to_register(node_dst, dst_reg))
+                lines.extend(self._emit_expression_to_register(node_src, src_reg))
+                lines.extend(self._emit_expression_to_register(node_cnt, cnt_reg))
+                lines.append(f"    STRNCPY {dst_reg}, {src_reg}, {cnt_reg}")
+                self._release_temp_register(cnt_reg)
+                self._release_temp_register(src_reg)
+                self._release_temp_register(dst_reg)
+                return lines, False
+
+            # strcpy(dest, src) - copy null-terminated string
+            if name == "strcpy" and len(args) == 2:
+                node_dst = self._parse_expression_node(args[0])
+                node_src = self._parse_expression_node(args[1])
+                dst_reg = self._acquire_temp_register()
+                src_reg = self._acquire_temp_register()
+                lines.extend(self._emit_expression_to_register(node_dst, dst_reg))
+                lines.extend(self._emit_expression_to_register(node_src, src_reg))
+                lines.append(f"    STRCPY {dst_reg}, {src_reg}")
+                self._release_temp_register(src_reg)
+                self._release_temp_register(dst_reg)
+                return lines, False
+
+            # strcat(dest, src) - append null-terminated string src to dest
+            if name == "strcat" and len(args) == 2:
+                node_dst = self._parse_expression_node(args[0])
+                node_src = self._parse_expression_node(args[1])
+                dst_reg = self._acquire_temp_register()
+                src_reg = self._acquire_temp_register()
+                lines.extend(self._emit_expression_to_register(node_dst, dst_reg))
+                lines.extend(self._emit_expression_to_register(node_src, src_reg))
+                lines.append(f"    STRCAT {dst_reg}, {src_reg}")
+                self._release_temp_register(src_reg)
+                self._release_temp_register(dst_reg)
+                return lines, False
+
+            # memcpy(dest, src, n) as statement form
+            if name == "memcpy" and len(args) == 3:
+                node_dst = self._parse_expression_node(args[0])
+                node_src = self._parse_expression_node(args[1])
+                node_cnt = self._parse_expression_node(args[2])
+                dst_reg = self._acquire_temp_register()
+                src_reg = self._acquire_temp_register()
+                cnt_reg = self._acquire_temp_register()
+                lines.extend(self._emit_expression_to_register(node_dst, dst_reg))
+                lines.extend(self._emit_expression_to_register(node_src, src_reg))
+                lines.extend(self._emit_expression_to_register(node_cnt, cnt_reg))
+                lines.append(f"    MEMCPY {dst_reg}, {src_reg}, {cnt_reg}")
+                self._release_temp_register(cnt_reg)
+                self._release_temp_register(src_reg)
+                self._release_temp_register(dst_reg)
+                return lines, False
+
+            # memcmp(a, b, n) as statement form (discard result)
+            if name == "memcmp" and len(args) == 3:
+                a_node = self._parse_expression_node(args[0])
+                b_node = self._parse_expression_node(args[1])
+                cnt_node = self._parse_expression_node(args[2])
+                a_reg = self._acquire_temp_register()
+                b_reg = self._acquire_temp_register()
+                cnt_reg = self._acquire_temp_register()
+                lines.extend(self._emit_expression_to_register(a_node, a_reg))
+                lines.extend(self._emit_expression_to_register(b_node, b_reg))
+                lines.extend(self._emit_expression_to_register(cnt_node, cnt_reg))
+                lines.append(f"    CMPS R0, {a_reg}, {b_reg}, {cnt_reg}")
+                self._release_temp_register(cnt_reg)
+                self._release_temp_register(b_reg)
+                self._release_temp_register(a_reg)
+                return lines, False
+
+            # itoa(value, buf, base) as statement form
+            if name == "itoa" and len(args) in (2,3):
+                val_node = self._parse_expression_node(args[0])
+                buf_node = self._parse_expression_node(args[1])
+                base_node = self._parse_expression_node(args[2]) if len(args) == 3 else None
+                val_reg = self._acquire_temp_register()
+                buf_reg = self._acquire_temp_register()
+                lines.extend(self._emit_expression_to_register(val_node, val_reg))
+                lines.extend(self._emit_expression_to_register(buf_node, buf_reg))
+                if base_node:
+                    base_reg = self._acquire_temp_register()
+                    lines.extend(self._emit_expression_to_register(base_node, base_reg))
+                    lines.append(f"    ITOA {buf_reg}, {val_reg}, {base_reg}")
+                    self._release_temp_register(base_reg)
+                else:
+                    lines.append(f"    ITOA {buf_reg}, {val_reg}")
+                self._release_temp_register(buf_reg)
+                self._release_temp_register(val_reg)
+                return lines, False
+
+            # strncat(dest, src, n) - append up to n bytes from src to dest
+            if name == "strncat" and len(args) == 3:
+                node_dst = self._parse_expression_node(args[0])
+                node_src = self._parse_expression_node(args[1])
+                node_cnt = self._parse_expression_node(args[2])
+                dst_reg = self._acquire_temp_register()
+                src_reg = self._acquire_temp_register()
+                cnt_reg = self._acquire_temp_register()
+                lines.extend(self._emit_expression_to_register(node_dst, dst_reg))
+                lines.extend(self._emit_expression_to_register(node_src, src_reg))
+                lines.extend(self._emit_expression_to_register(node_cnt, cnt_reg))
+                lines.append(f"    STRNCAT {dst_reg}, {src_reg}, {cnt_reg}")
+                self._release_temp_register(cnt_reg)
+                self._release_temp_register(src_reg)
+                self._release_temp_register(dst_reg)
+                return lines, False
+
+            # strchr(hay, needle) as statement form - call and discard return
+            if name == "strchr" and len(args) == 2:
+                node_hay = self._parse_expression_node(args[0])
+                node_needle = self._parse_expression_node(args[1])
+                hay_reg = self._acquire_temp_register()
+                needle_reg = self._acquire_temp_register()
+                lines.extend(self._emit_expression_to_register(node_hay, hay_reg))
+                lines.extend(self._emit_expression_to_register(node_needle, needle_reg))
+                # Use STRCHR opcode (result in R0) but we ignore it for statement
+                lines.append(f"    STRCHR R0, {hay_reg}, {needle_reg}")
+                self._release_temp_register(needle_reg)
+                self._release_temp_register(hay_reg)
+                return lines, False
+
+            # memchr(base, byte, n) as statement form (discard result)
+            if name == "memchr" and len(args) == 3:
+                base_node = self._parse_expression_node(args[0])
+                byte_node = self._parse_expression_node(args[1])
+                cnt_node = self._parse_expression_node(args[2])
+                base_reg = self._acquire_temp_register()
+                byte_reg = self._acquire_temp_register()
+                cnt_reg = self._acquire_temp_register()
+                lines.extend(self._emit_expression_to_register(base_node, base_reg))
+                lines.extend(self._emit_expression_to_register(byte_node, byte_reg))
+                lines.extend(self._emit_expression_to_register(cnt_node, cnt_reg))
+                lines.append(f"    MOV R0, {base_reg}")
+                lines.append(f"    MOV R1, {byte_reg}")
+                lines.append(f"    MOV R2, {cnt_reg}")
+                lines.append(f"    MEMCHR")
+                self._release_temp_register(cnt_reg)
+                self._release_temp_register(byte_reg)
+                self._release_temp_register(base_reg)
+                return lines, False
+
+            # revmem(addr, len) as statement form (in-place reverse)
+            if name == "revmem" and len(args) == 2:
+                base_node = self._parse_expression_node(args[0])
+                cnt_node = self._parse_expression_node(args[1])
+                base_reg = self._acquire_temp_register()
+                cnt_reg = self._acquire_temp_register()
+                lines.extend(self._emit_expression_to_register(base_node, base_reg))
+                lines.extend(self._emit_expression_to_register(cnt_node, cnt_reg))
+                lines.append(f"    MOV R0, {base_reg}")
+                lines.append(f"    MOV R1, {cnt_reg}")
+                lines.append(f"    REV_MEM")
+                self._release_temp_register(cnt_reg)
+                self._release_temp_register(base_reg)
                 return lines, False
             
             # Graphics functions (statement form)
@@ -6427,7 +6712,98 @@ class CppCompiler:
         expr = re.sub(r'!(?!=)', ' not ', expr)
         expr = re.sub(r'\btrue\b', 'True', expr)
         expr = re.sub(r'\bfalse\b', 'False', expr)
+        # Convert C-style ternary operator a ? b : c -> Python's (b) if (a) else (c)
+        try:
+            expr = self._convert_c_ternary(expr)
+        except Exception:
+            # If conversion fails, leave expression unchanged and let parser report syntax
+            pass
         return expr
+
+    def _convert_c_ternary(self, expr: str) -> str:
+        """Recursively convert C-style ternary operators to Python if-expr.
+
+        This is a simple, conservative converter that finds the first top-level
+        '?' and its matching ':' (respecting parentheses and string literals),
+        then rewrites `a ? b : c` as `(b) if (a) else (c)` and recurses.
+        """
+        s = expr
+        # Quick exit if no ternary
+        if '?' not in s:
+            return s
+
+        def find_top_level_question(s):
+            in_str = False
+            escape = False
+            depth = 0
+            for i, ch in enumerate(s):
+                if escape:
+                    escape = False
+                    continue
+                if ch == '\\':
+                    escape = True
+                    continue
+                if ch == '"' or ch == "'":
+                    in_str = not in_str
+                    continue
+                if in_str:
+                    continue
+                if ch == '(':
+                    depth += 1
+                elif ch == ')':
+                    if depth > 0:
+                        depth -= 1
+                elif ch == '?' and depth == 0:
+                    return i
+            return -1
+
+        def find_matching_colon(s, qpos):
+            in_str = False
+            escape = False
+            depth = 0
+            tern_level = 0
+            for i in range(qpos+1, len(s)):
+                ch = s[i]
+                if escape:
+                    escape = False
+                    continue
+                if ch == '\\':
+                    escape = True
+                    continue
+                if ch == '"' or ch == "'":
+                    in_str = not in_str
+                    continue
+                if in_str:
+                    continue
+                if ch == '(':
+                    depth += 1
+                elif ch == ')':
+                    if depth > 0:
+                        depth -= 1
+                elif ch == '?' and depth == 0:
+                    tern_level += 1
+                elif ch == ':' and depth == 0:
+                    if tern_level == 0:
+                        return i
+                    tern_level -= 1
+            return -1
+
+        qpos = find_top_level_question(s)
+        if qpos == -1:
+            return s
+        cpos = find_matching_colon(s, qpos)
+        if cpos == -1:
+            # malformed ternary; leave as-is
+            return s
+        test = s[:qpos].strip()
+        true_part = s[qpos+1:cpos].strip()
+        false_part = s[cpos+1:].strip()
+        # Recursively convert nested ternaries in parts
+        test_py = self._convert_c_ternary(test)
+        true_py = self._convert_c_ternary(true_part)
+        false_py = self._convert_c_ternary(false_part)
+        new_expr = f"({true_py}) if ({test_py}) else ({false_py})"
+        return new_expr
 
     def _compile_declaration(self, stmt: str) -> List[str]:
         stmt = stmt.rstrip(";").strip()
@@ -6636,6 +7012,11 @@ class CppCompiler:
             raise CppCompilerError("Out of temporary registers for expression evaluation")
         reg = self.temp_register_pool.pop()
         self._temp_register_stack.append(reg)
+        # Debug logging for register allocation
+        try:
+            self.log(f"acquire_temp: {reg} (pool now: {self.temp_register_pool})", "DEBUG")
+        except Exception:
+            pass
         return reg
 
     def _release_temp_register(self, reg: str):
@@ -6643,6 +7024,10 @@ class CppCompiler:
             self._temp_register_stack.remove(reg)
             self.stats["registers_reused"] += 1
         self.temp_register_pool.append(reg)
+        try:
+            self.log(f"release_temp: {reg} (pool now: {self.temp_register_pool})", "DEBUG")
+        except Exception:
+            pass
     
     def _release_all_temp_registers(self):
         """Release all temp registers - useful for cleanup"""
@@ -6676,6 +7061,11 @@ class CppCompiler:
 
     def _emit_expression_to_register(self, node, target: str) -> List[str]:
         code: List[str] = []
+        # Handle constant string literals explicitly (return address to string)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            label = self._add_string_literal(node.value)
+            return [f"    LOADI {target}, {label}"]
+
         const_val = self._try_constant_value(node)
         if const_val is not None:
             code.extend(self._emit_load_immediate(target, const_val))
@@ -6729,9 +7119,33 @@ class CppCompiler:
             raise CppCompilerError("Array subscript not supported in this context")
         
         if isinstance(node, ast.Name):
+            # If this name refers to a declared array, return its base address
+            if node.id in self.arrays:
+                base_addr = self.arrays[node.id]["addr"]
+                code.append(f"    LOADI {target}, {base_addr}")
+                return code
             src = self._require_variable(node.id)
             if src != target:
                 code.append(f"    MOV {target}, {src}")
+            return code
+        # Ternary conditional operator: <test> ? <body> : <orelse>
+        if isinstance(node, ast.IfExp):
+            # Evaluate test into a temp register
+            test_reg = self._acquire_temp_register()
+            code.extend(self._emit_expression_to_register(node.test, test_reg))
+            lbl_true = self._new_label('tern_true')
+            lbl_done = self._new_label('tern_done')
+            # If test == 0 -> false branch
+            code.append(f"    CMP {test_reg}, 0")
+            code.append(f"    JE {lbl_true}")
+            # true branch: evaluate body into target
+            code.extend(self._emit_expression_to_register(node.body, target))
+            code.append(f"    JMP {lbl_done}")
+            # false branch
+            code.append(f"{lbl_true}:")
+            code.extend(self._emit_expression_to_register(node.orelse, target))
+            code.append(f"{lbl_done}:")
+            self._release_temp_register(test_reg)
             return code
         if isinstance(node, ast.Compare):
             if len(node.ops) != 1 or len(node.comparators) != 1:
@@ -6799,6 +7213,8 @@ class CppCompiler:
                 return code
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             fname = node.func.id
+            # Small debug trace of intrinsic resolution
+            self.log(f"emit_call: {fname} args={len(node.args)} target={target}", "DEBUG")
             # Intrinsic math helpers mapped directly to CPU opcodes
             if fname == "abs" and len(node.args) == 1:
                 # abs(x) -> ABS target, target
@@ -7036,6 +7452,125 @@ class CppCompiler:
                 self._release_temp_register(addr2_reg)
                 self._release_temp_register(addr1_reg)
                 return code
+
+            # strchr(hay, needle) -> STRCHR target, hay_reg, needle_reg
+            if fname == "strchr" and len(node.args) == 2:
+                hay_reg = self._acquire_temp_register()
+                needle_reg = self._acquire_temp_register()
+                code.extend(self._emit_expression_to_register(node.args[0], hay_reg))
+                code.extend(self._emit_expression_to_register(node.args[1], needle_reg))
+                code.append(f"    STRCHR {target}, {hay_reg}, {needle_reg}")
+                self._release_temp_register(needle_reg)
+                self._release_temp_register(hay_reg)
+                return code
+
+            # strncat(dest, src, n) -> STRNCAT dst_reg, src_reg, cnt_reg
+            if fname == "strncat" and len(node.args) == 3:
+                dst_reg = self._acquire_temp_register()
+                src_reg = self._acquire_temp_register()
+                cnt_reg = self._acquire_temp_register()
+                code.extend(self._emit_expression_to_register(node.args[0], dst_reg))
+                code.extend(self._emit_expression_to_register(node.args[1], src_reg))
+                code.extend(self._emit_expression_to_register(node.args[2], cnt_reg))
+                code.append(f"    STRNCAT {dst_reg}, {src_reg}, {cnt_reg}")
+                code.append(f"    MOV {target}, {dst_reg}")
+                self._release_temp_register(cnt_reg)
+                self._release_temp_register(src_reg)
+                self._release_temp_register(dst_reg)
+                return code
+
+            # atoi(str) -> ATOI target
+            if fname == "atoi" and len(node.args) == 1:
+                code.extend(self._emit_expression_to_register(node.args[0], target))
+                code.append(f"    ATOI {target}, {target}")
+                return code
+            # memcpy(dest, src, n) -> MEMCPY dst_reg, src_reg, cnt_reg
+            if fname == "memcpy" and len(node.args) == 3:
+                dst_reg = self._acquire_temp_register()
+                src_reg = self._acquire_temp_register()
+                cnt_reg = self._acquire_temp_register()
+                code.extend(self._emit_expression_to_register(node.args[0], dst_reg))
+                code.extend(self._emit_expression_to_register(node.args[1], src_reg))
+                code.extend(self._emit_expression_to_register(node.args[2], cnt_reg))
+                code.append(f"    MEMCPY {dst_reg}, {src_reg}, {cnt_reg}")
+                code.append(f"    MOV {target}, {dst_reg}")
+                self._release_temp_register(cnt_reg)
+                self._release_temp_register(src_reg)
+                self._release_temp_register(dst_reg)
+                return code
+
+            # memcmp(a, b, n) -> CMPS target, a_reg, b_reg, cnt_reg
+            if fname == "memcmp" and len(node.args) == 3:
+                a_reg = self._acquire_temp_register()
+                b_reg = self._acquire_temp_register()
+                cnt_reg = self._acquire_temp_register()
+                code.extend(self._emit_expression_to_register(node.args[0], a_reg))
+                code.extend(self._emit_expression_to_register(node.args[1], b_reg))
+                code.extend(self._emit_expression_to_register(node.args[2], cnt_reg))
+                code.append(f"    CMPS {target}, {a_reg}, {b_reg}, {cnt_reg}")
+                self._release_temp_register(cnt_reg)
+                self._release_temp_register(b_reg)
+                self._release_temp_register(a_reg)
+                return code
+
+            # memchr(base, byte, n) -> search memory for byte, return address or 0
+            if fname == "memchr" and len(node.args) == 3:
+                base_reg = self._acquire_temp_register()
+                byte_reg = self._acquire_temp_register()
+                cnt_reg = self._acquire_temp_register()
+                code.extend(self._emit_expression_to_register(node.args[0], base_reg))
+                code.extend(self._emit_expression_to_register(node.args[1], byte_reg))
+                code.extend(self._emit_expression_to_register(node.args[2], cnt_reg))
+                # Move into R0,R1,R2 convention expected by CPU handler
+                code.append(f"    MOV R0, {base_reg}")
+                code.append(f"    MOV R1, {byte_reg}")
+                code.append(f"    MOV R2, {cnt_reg}")
+                code.append(f"    MEMCHR")
+                code.append(f"    MOV {target}, R0")
+                self._release_temp_register(cnt_reg)
+                self._release_temp_register(byte_reg)
+                self._release_temp_register(base_reg)
+                return code
+
+            # revmem(addr, len) -> reverse bytes in-place; returns 0
+            if fname == "revmem" and len(node.args) == 2:
+                base_reg = self._acquire_temp_register()
+                cnt_reg = self._acquire_temp_register()
+                code.extend(self._emit_expression_to_register(node.args[0], base_reg))
+                code.extend(self._emit_expression_to_register(node.args[1], cnt_reg))
+                code.append(f"    MOV R0, {base_reg}")
+                code.append(f"    MOV R1, {cnt_reg}")
+                code.append(f"    REV_MEM")
+                code.append(f"    LOADI {target}, 0")
+                self._release_temp_register(cnt_reg)
+                self._release_temp_register(base_reg)
+                return code
+
+            # strncpy(dest, src, n) -> STRNCPY dst_reg, src_reg, cnt_reg
+            if fname == "strncpy" and len(node.args) == 3:
+                dst_reg = self._acquire_temp_register()
+                src_reg = self._acquire_temp_register()
+                cnt_reg = self._acquire_temp_register()
+                code.extend(self._emit_expression_to_register(node.args[0], dst_reg))
+                code.extend(self._emit_expression_to_register(node.args[1], src_reg))
+                code.extend(self._emit_expression_to_register(node.args[2], cnt_reg))
+                code.append(f"    STRNCPY {dst_reg}, {src_reg}, {cnt_reg}")
+                code.append(f"    MOV {target}, {dst_reg}")
+                self._release_temp_register(cnt_reg)
+                self._release_temp_register(src_reg)
+                self._release_temp_register(dst_reg)
+                return code
+
+            # strstr(hay, needle) -> STRSTR target, hay_reg, needle_reg
+            if fname == "strstr" and len(node.args) == 2:
+                hay_reg = self._acquire_temp_register()
+                needle_reg = self._acquire_temp_register()
+                code.extend(self._emit_expression_to_register(node.args[0], hay_reg))
+                code.extend(self._emit_expression_to_register(node.args[1], needle_reg))
+                code.append(f"    STRSTR {target}, {hay_reg}, {needle_reg}")
+                self._release_temp_register(needle_reg)
+                self._release_temp_register(hay_reg)
+                return code
             # Bit rotation
             if fname == "rotl" and len(node.args) == 2:
                 # rotl(value, shift) -> rotate left
@@ -7198,6 +7733,12 @@ class CppCompiler:
             if should_release:
                 self._release_temp_register(rhs_reg)
             return code
+        # Emit a helpful debug message about unsupported node types
+        try:
+            nodetype = type(node).__name__
+        except Exception:
+            nodetype = str(node)
+        self.log(f"unsupported_expression_node: {nodetype}", "ERROR")
         raise CppCompilerError("Unsupported expression construct")
 
     def _emit_coerce_to_bool(self, reg: str) -> List[str]:
