@@ -5706,8 +5706,8 @@ class CppCompiler:
         return "\n".join(lines)
     
     def _extract_and_process_classes(self, code: str) -> str:
-        """Extract class definitions and process them, returning code without classes"""
-        # Use character-by-character parsing to handle classes on same line as other code
+        """Extract class/struct definitions and process them, returning code without them"""
+        # Use character-by-character parsing to handle class/struct on same line as other code
         result = []
         i = 0
         
@@ -5720,11 +5720,17 @@ class CppCompiler:
             if i >= len(code):
                 break
             
-            # Check if we're at the start of a class definition
+            # Check if we're at the start of a class or struct definition
+            keyword = None
             if code[i:i+5] == 'class' and (i + 5 >= len(code) or code[i+5] in ' \t\n\r'):
-                # Found a class definition
+                keyword = 'class'
+            elif code[i:i+6] == 'struct' and (i + 6 >= len(code) or code[i+6] in ' \t\n\r'):
+                keyword = 'struct'
+
+            if keyword is not None:
+                # Found a class/struct definition
                 class_start = i
-                i += 5
+                i += len(keyword)
                 
                 # Skip whitespace
                 while i < len(code) and code[i] in ' \t\n\r':
@@ -5759,12 +5765,12 @@ class CppCompiler:
                 if i < len(code) and code[i] == ';':
                     i += 1
                 
-                # Extract and process the class
+                # Extract and process the class/struct
                 class_text = code[class_start:i]
                 try:
                     self._process_class_definition(class_text)
                 except CppCompilerError as e:
-                    self.warnings.append(f"Class definition error: {e}")
+                    self.warnings.append(f"Class/struct definition error: {e}")
                 
                 # Don't add class text to result
                 continue
@@ -5780,13 +5786,13 @@ class CppCompiler:
         # Remove trailing semicolon
         class_text = class_text.rstrip(';').strip()
         
-        # Extract class name and body
-        match = re.match(r'class\s+([A-Za-z_]\w*)\s*\{(.+)\}', class_text, re.DOTALL)
+        # Extract class/struct name and body
+        match = re.match(r'(class|struct)\s+([A-Za-z_]\w*)\s*\{(.+)\}', class_text, re.DOTALL)
         if not match:
             raise CppCompilerError(f"Invalid class definition")
         
-        class_name = match.group(1)
-        body = match.group(2).strip()
+        class_name = match.group(2)
+        body = match.group(3).strip()
         
         if class_name in self.class_definitions:
             raise CppCompilerError(f"Class '{class_name}' already defined")
@@ -5912,11 +5918,13 @@ class CppCompiler:
         incdec_code = self._compile_incdec_statement(stmt)
         if incdec_code is not None:
             return incdec_code, False
-        if stmt.startswith("class "):
+        if stmt.startswith("class ") or stmt.startswith("struct "):
             return self._compile_class_definition(stmt), False
         # Match printf( at word boundary, not printf_int or other variants
         if re.match(r'^printf\s*\(', stmt):
             return self._translate_printf(stmt), False
+        if re.match(r"switch\b", stmt):
+            return self._translate_switch(stmt), False
         if stmt.startswith("return"):
             return self._translate_return(stmt), True
         if stmt.startswith("if"):
@@ -5930,8 +5938,8 @@ class CppCompiler:
             if '[' in stmt and ']' in stmt and '=' not in stmt.split('[')[0]:
                 return self._compile_array_declaration(stmt), False
             return self._compile_declaration(stmt), False
-        # Compound assignments like a += b, a <<= 1, etc.
-        m_comp = re.match(r'^([A-Za-z_]\w*)\s*(\+=|-=|\*=|/=|&=|\|=|\^=|<<=|>>=)\s*(.+)$', stmt.rstrip(';').strip())
+        # Compound assignments like a += b, a <<= 1, a %= b, etc.
+        m_comp = re.match(r'^([A-Za-z_]\w*)\s*(\+=|-=|\*=|/=|%=|&=|\|=|\^=|<<=|>>=)\s*(.+)$', stmt.rstrip(';').strip())
         if m_comp:
             return self._compile_compound_assignment(m_comp), False
         if "=" in stmt:
@@ -6515,6 +6523,132 @@ class CppCompiler:
         lines.append(f"{end_label}:")
         return lines
 
+    def _translate_switch(self, stmt: str) -> List[str]:
+        """Translate a simple integer switch statement.
+
+        Supported form:
+
+            switch (expr) {
+                case 1:
+                    ...
+                    break;
+                case 2:
+                    ...
+                    break;
+                default:
+                    ...
+            }
+
+        Semantics:
+        - expr is evaluated once into a temp register
+        - each case N compares expr against N and jumps to a case label
+        - default (if present) is used when no case matches
+        - break; inside the switch jumps to the end of the switch
+        """
+        condition, remainder = self._extract_parenthesized(stmt)
+        remainder = remainder.strip()
+        if not remainder.startswith("{"):
+            raise CppCompilerError("switch statement requires a block body")
+
+        body_text, tail = self._extract_block(remainder)
+        tail = tail.strip()
+        if tail:
+            self.warnings.append(f"Ignoring tokens after switch block: {tail}")
+
+        # Parse the body into cases
+        lines_src = body_text.splitlines()
+        cases: List[Tuple[str, Optional[int], str]] = []  # (kind, value, body_text)
+        current_kind: Optional[str] = None
+        current_val: Optional[int] = None
+        current_buf: List[str] = []
+
+        for raw in lines_src:
+            stripped = raw.strip()
+            if stripped.startswith("case "):
+                # Flush previous case/default
+                if current_kind is not None:
+                    cases.append((current_kind, current_val, "\n".join(current_buf)))
+                m = re.match(r"case\s+(-?\d+)\s*:", stripped)
+                if not m:
+                    raise CppCompilerError(f"Invalid case label: {stripped}")
+                current_kind = "case"
+                current_val = int(m.group(1))
+                current_buf = []
+                continue
+            if stripped.startswith("default:"):
+                if current_kind is not None:
+                    cases.append((current_kind, current_val, "\n".join(current_buf)))
+                current_kind = "default"
+                current_val = None
+                current_buf = []
+                continue
+            current_buf.append(raw)
+
+        if current_kind is not None:
+            cases.append((current_kind, current_val, "\n".join(current_buf)))
+
+        if not cases:
+            raise CppCompilerError("switch body must contain at least one case or default label")
+
+        end_label = self._new_label("switch_end")
+        default_label: Optional[str] = None
+
+        # Evaluate the switch expression once
+        cond_reg = self._acquire_temp_register()
+        cond_node = self._parse_expression_node(condition.strip())
+        lines: List[str] = []
+        lines.extend(self._emit_expression_to_register(cond_node, cond_reg))
+
+        # First pass: create labels and comparison jumps for each case
+        case_labels: List[Tuple[int, str]] = []
+        for kind, value, _body in cases:
+            if kind == "case" and value is not None:
+                lbl = self._new_label("case")
+                case_labels.append((value, lbl))
+            elif kind == "default":
+                if default_label is None:
+                    default_label = self._new_label("default")
+
+        # Emit comparisons for each numeric case
+        for value, lbl in case_labels:
+            lines.append(f"    CMP {cond_reg}, {value}")
+            lines.append(f"    JE {lbl}")
+
+        # No more need for cond_reg after comparisons
+        self._release_temp_register(cond_reg)
+
+        if default_label is not None:
+            lines.append(f"    JMP {default_label}")
+        else:
+            lines.append(f"    JMP {end_label}")
+
+        # Second pass: emit bodies
+        case_idx = 0
+        for kind, value, body in cases:
+            if kind == "case" and value is not None:
+                # Use label assigned in first pass
+                _, lbl = case_labels[case_idx]
+                case_idx += 1
+                lines.append(f"{lbl}:")
+            elif kind == "default":
+                if default_label is None:
+                    # Should not happen, but guard anyway
+                    default_label = self._new_label("default")
+                lines.append(f"{default_label}:")
+            else:
+                continue
+
+            # Inside a switch, break; jumps to end_label
+            self.loop_stack.append({"break": end_label, "continue": end_label})
+            try:
+                body_code = self._compile_block(body)
+            finally:
+                self.loop_stack.pop()
+            lines.extend(body_code)
+
+        lines.append(f"{end_label}:")
+        return lines
+
     def _translate_for(self, stmt: str) -> List[str]:
         header, remainder = self._extract_parenthesized(stmt)
         header = header.strip()
@@ -6950,6 +7084,7 @@ class CppCompiler:
                 
                 arr_info = self.arrays[arr_name]
                 base_addr = arr_info["addr"]
+                size = int(arr_info.get("size", 0))
                 
                 code: List[str] = []
                 
@@ -6962,6 +7097,9 @@ class CppCompiler:
                 idx_reg = self._acquire_temp_register()
                 idx_node = self._parse_expression_node(index_expr)
                 code.extend(self._emit_expression_to_register(idx_node, idx_reg))
+                # Bounds check: 0 <= index < size
+                if size > 0:
+                    code.extend(self._emit_bounds_check(idx_reg, size))
                 
                 # Calculate address: base + (index * 4)
                 addr_reg = self._acquire_temp_register()
@@ -7012,7 +7150,13 @@ class CppCompiler:
             elif op == "* =" or op == "*=":
                 code.append(f"    MUL {reg}, {treg}")
             elif op == "/=":
+                # Division assignment with runtime div-by-zero check
+                code.extend(self._emit_div_zero_check(treg))
                 code.append(f"    DIV {reg}, {treg}")
+            elif op == "%=":
+                # Modulo assignment with runtime div-by-zero check
+                code.extend(self._emit_div_zero_check(treg))
+                code.append(f"    MOD {reg}, {treg}")
             elif op == "&=":
                 code.append(f"    AND {reg}, {treg}")
             elif op == "|=":
@@ -7041,6 +7185,9 @@ class CppCompiler:
                 elif op == "/=":
                     if rhs != 0:
                         self.variables[name] = base // rhs
+                elif op == "%=":
+                    if rhs != 0:
+                        self.variables[name] = base % rhs
                 elif op == "&=":
                     self.variables[name] = base & rhs
                 elif op == "|=":
@@ -7184,10 +7331,14 @@ class CppCompiler:
                 if arr_name in self.arrays:
                     arr_info = self.arrays[arr_name]
                     base_addr = arr_info["addr"]
+                    size = int(arr_info.get("size", 0))
                     
                     # Evaluate index
                     idx_reg = self._acquire_temp_register()
                     code.extend(self._emit_expression_to_register(node.slice, idx_reg))
+                    # Bounds check: 0 <= index < size
+                    if size > 0:
+                        code.extend(self._emit_bounds_check(idx_reg, size))
                     
                     # Calculate address: base + (index * 4)
                     addr_reg = self._acquire_temp_register()
@@ -7435,6 +7586,62 @@ class CppCompiler:
                 self._release_temp_register(b_reg)
                 return code
 
+            # clamp(x, lo, hi) -> min(max(x, lo), hi)
+            if fname == "clamp" and len(node.args) == 3:
+                # Evaluate x into target
+                code.extend(self._emit_expression_to_register(node.args[0], target))
+                lo_reg = self._acquire_temp_register()
+                hi_reg = self._acquire_temp_register()
+                code.extend(self._emit_expression_to_register(node.args[1], lo_reg))
+                code.extend(self._emit_expression_to_register(node.args[2], hi_reg))
+                lbl_low = self._new_label("clamp_low")
+                lbl_high = self._new_label("clamp_high")
+                lbl_done = self._new_label("clamp_done")
+                # if x < lo -> lo
+                code.append(f"    CMP {target}, {lo_reg}")
+                code.append(f"    JL {lbl_low}")
+                # if x > hi -> hi
+                code.append(f"    CMP {target}, {hi_reg}")
+                code.append(f"    JG {lbl_high}")
+                code.append(f"    JMP {lbl_done}")
+                code.append(f"{lbl_low}:")
+                code.append(f"    MOV {target}, {lo_reg}")
+                code.append(f"    JMP {lbl_done}")
+                code.append(f"{lbl_high}:")
+                code.append(f"    MOV {target}, {hi_reg}")
+                code.append(f"{lbl_done}:")
+                self._release_temp_register(hi_reg)
+                self._release_temp_register(lo_reg)
+                return code
+
+            # smoothstep(x, edge0, edge1) -> integer smooth clamp alias
+            if fname == "smoothstep" and len(node.args) == 3:
+                # Implement as clamp(x, edge0, edge1) in integer space
+                code.extend(self._emit_expression_to_register(node.args[0], target))
+                lo_reg = self._acquire_temp_register()
+                hi_reg = self._acquire_temp_register()
+                code.extend(self._emit_expression_to_register(node.args[1], lo_reg))
+                code.extend(self._emit_expression_to_register(node.args[2], hi_reg))
+                lbl_low = self._new_label("smooth_low")
+                lbl_high = self._new_label("smooth_high")
+                lbl_done = self._new_label("smooth_done")
+                # if x < edge0 -> edge0
+                code.append(f"    CMP {target}, {lo_reg}")
+                code.append(f"    JL {lbl_low}")
+                # if x > edge1 -> edge1
+                code.append(f"    CMP {target}, {hi_reg}")
+                code.append(f"    JG {lbl_high}")
+                code.append(f"    JMP {lbl_done}")
+                code.append(f"{lbl_low}:")
+                code.append(f"    MOV {target}, {lo_reg}")
+                code.append(f"    JMP {lbl_done}")
+                code.append(f"{lbl_high}:")
+                code.append(f"    MOV {target}, {hi_reg}")
+                code.append(f"{lbl_done}:")
+                self._release_temp_register(hi_reg)
+                self._release_temp_register(lo_reg)
+                return code
+
             # mad(a, b, c) -> a * b + c
             if fname == "mad" and len(node.args) == 3:
                 a_reg = self._acquire_temp_register()
@@ -7509,6 +7716,22 @@ class CppCompiler:
                 self._release_temp_register(b_reg)
                 self._release_temp_register(a_reg)
                 return code
+            if fname == "min3" and len(node.args) == 3:
+                # min3(a, b, c) -> minimum of three values
+                a_reg = self._acquire_temp_register()
+                b_reg = self._acquire_temp_register()
+                c_reg = self._acquire_temp_register()
+                code.extend(self._emit_expression_to_register(node.args[0], a_reg))
+                code.extend(self._emit_expression_to_register(node.args[1], b_reg))
+                code.extend(self._emit_expression_to_register(node.args[2], c_reg))
+                # target = min(a, b, c)
+                code.append(f"    MOV {target}, {a_reg}")
+                code.append(f"    MIN {target}, {b_reg}")
+                code.append(f"    MIN {target}, {c_reg}")
+                self._release_temp_register(c_reg)
+                self._release_temp_register(b_reg)
+                self._release_temp_register(a_reg)
+                return code
             if fname == "max" and len(node.args) == 2:
                 # max(a, b) -> maximum of two values
                 code.extend(self._emit_expression_to_register(node.args[0], target))
@@ -7548,6 +7771,20 @@ class CppCompiler:
                     # Dynamic t - need to use a different approach
                     # For now, emit a warning and use 128 (0.5)
                     self.warnings.append("lerp() with non-constant t uses t=128 (0.5)")
+                    code.append(f"    LERP {target}, {b_reg}, 128")
+                self._release_temp_register(b_reg)
+                return code
+            if fname == "lerp_int" and len(node.args) == 3:
+                # lerp_int(a, b, t) -> integer lerp alias to lerp()
+                code.extend(self._emit_expression_to_register(node.args[0], target))
+                b_reg = self._acquire_temp_register()
+                code.extend(self._emit_expression_to_register(node.args[1], b_reg))
+                t_val = self._try_constant_value(node.args[2])
+                if t_val is not None:
+                    t_val = max(0, min(255, t_val))
+                    code.append(f"    LERP {target}, {b_reg}, {t_val}")
+                else:
+                    self.warnings.append("lerp_int() with non-constant t uses t=128 (0.5)")
                     code.append(f"    LERP {target}, {b_reg}, 128")
                 self._release_temp_register(b_reg)
                 return code
@@ -8028,6 +8265,52 @@ class CppCompiler:
         lines.append(f"{lbl_true}:")
         return lines
 
+    def _emit_div_zero_check(self, divisor_reg: str) -> List[str]:
+        """Generate division-by-zero checking code for integer ops.
+
+        This emits a small check that branches to a trap label if the divisor
+        is zero. The trap currently halts the program, which is the safest
+        behavior for cas++ programs inside SimpleOS.
+        """
+        lines: List[str] = []
+        err_lbl = self._new_label("div_zero")
+        ok_lbl = self._new_label("div_ok")
+        lines.append("    ; Division by zero check")
+        lines.append("    LOADI R0, 0")
+        lines.append(f"    CMP {divisor_reg}, R0")
+        lines.append(f"    JE {err_lbl}")
+        lines.append(f"    JMP {ok_lbl}")
+        lines.append(f"{err_lbl}:")
+        lines.append("    ; Division by zero - halting")
+        lines.append("    HALT")
+        lines.append(f"{ok_lbl}:")
+        return lines
+
+    def _emit_bounds_check(self, index_reg: str, size: int) -> List[str]:
+        """Generate array bounds checking code for 0 <= index < size.
+
+        This is used for all array subscripts so that out-of-bounds access
+        halts the program instead of silently corrupting memory.
+        """
+        lines: List[str] = []
+        err_lbl = self._new_label("bounds_error")
+        ok_lbl = self._new_label("bounds_ok")
+        lines.append("    ; Array bounds check")
+        # index < 0 ?
+        lines.append("    LOADI R0, 0")
+        lines.append(f"    CMP {index_reg}, R0")
+        lines.append(f"    JL {err_lbl}")
+        # index >= size ?
+        lines.append(f"    LOADI R0, {size}")
+        lines.append(f"    CMP {index_reg}, R0")
+        lines.append(f"    JGE {err_lbl}")
+        lines.append(f"    JMP {ok_lbl}")
+        lines.append(f"{err_lbl}:")
+        lines.append("    ; Array bounds error - halting")
+        lines.append("    HALT")
+        lines.append(f"{ok_lbl}:")
+        return lines
+
     def _load_operand(self, node) -> Tuple[List[str], str, bool]:
         if isinstance(node, ast.Name):
             return [], self._require_variable(node.id), False
@@ -8047,9 +8330,17 @@ class CppCompiler:
         if isinstance(op, ast.Mult):
             return [f"    MUL {target}, {rhs_reg}"]
         if isinstance(op, ast.Div) or isinstance(op, ast.FloorDiv):
-            return [f"    DIV {target}, {rhs_reg}"]
+            # Inject a runtime division-by-zero check before DIV
+            lines: List[str] = []
+            lines.extend(self._emit_div_zero_check(rhs_reg))
+            lines.append(f"    DIV {target}, {rhs_reg}")
+            return lines
         if isinstance(op, ast.Mod):
-            return [f"    MOD {target}, {rhs_reg}"]
+            # Inject a runtime division-by-zero check before MOD as well
+            lines: List[str] = []
+            lines.extend(self._emit_div_zero_check(rhs_reg))
+            lines.append(f"    MOD {target}, {rhs_reg}")
+            return lines
         if isinstance(op, ast.BitAnd):
             return [f"    AND {target}, {rhs_reg}"]
         if isinstance(op, ast.BitOr):
@@ -8165,13 +8456,13 @@ class CppCompiler:
         # Remove trailing semicolon if present
         stmt = stmt.rstrip(';').strip()
         
-        # Extract class name and body
-        match = re.match(r'class\s+([A-Za-z_]\w*)\s*\{(.+)\}', stmt, re.DOTALL)
+        # Extract class/struct name and body
+        match = re.match(r'(class|struct)\s+([A-Za-z_]\w*)\s*\{(.+)\}', stmt, re.DOTALL)
         if not match:
             # Maybe it's just the class header, store it for later
-            match2 = re.match(r'class\s+([A-Za-z_]\w*)\s*\{', stmt)
+            match2 = re.match(r'(class|struct)\s+([A-Za-z_]\w*)\s*\{', stmt)
             if match2:
-                class_name = match2.group(1)
+                class_name = match2.group(2)
                 # Register empty class for now
                 self.class_definitions[class_name] = {
                     "members": [],
@@ -8180,8 +8471,8 @@ class CppCompiler:
                 return [f"    ; Class {class_name} declared"]
             raise CppCompilerError(f"Invalid class definition: {stmt}")
         
-        class_name = match.group(1)
-        body = match.group(2).strip()
+        class_name = match.group(2)
+        body = match.group(3).strip()
         
         if class_name in self.class_definitions:
             raise CppCompilerError(f"Class '{class_name}' already defined")
