@@ -3750,33 +3750,44 @@ class CPU:
             val = self.reg_read(1) & 0xFF
             length = self.reg_read(2) & 0xFFFFFFFF
             found = 0
-            for i in range(length):
-                b = self.mem.read_byte((base + i) & 0xFFFFFFFF)
-                if b == val:
-                    found = (base + i) & 0xFFFFFFFF
-                    break
+            if length and base < self.mem.size:
+                max_len = self.mem.size - base
+                if max_len > 0:
+                    eff_len = length if length <= max_len else max_len
+                    for i in range(eff_len):
+                        b = self.mem.read_byte((base + i) & 0xFFFFFFFF)
+                        if b == val:
+                            found = (base + i) & 0xFFFFFFFF
+                            break
             self.reg_write(0, found)
         elif opcode == OP_REV_MEM:
             # REV_MEM: R0=base_addr, R1=length -> reverse bytes in-place
             base = self.reg_read(0) & 0xFFFFFFFF
             length = self.reg_read(1) & 0xFFFFFFFF
-            if length > 0:
-                i = 0
-                j = length - 1
-                while i < j:
-                    a = self.mem.read_byte((base + i) & 0xFFFFFFFF)
-                    b = self.mem.read_byte((base + j) & 0xFFFFFFFF)
-                    self.mem.write_byte((base + i) & 0xFFFFFFFF, b)
-                    self.mem.write_byte((base + j) & 0xFFFFFFFF, a)
-                    i += 1
-                    j -= 1
+            if length and base < self.mem.size:
+                max_len = self.mem.size - base
+                if max_len > 0:
+                    eff_len = length if length <= max_len else max_len
+                    i = 0
+                    j = eff_len - 1
+                    while i < j:
+                        a = self.mem.read_byte((base + i) & 0xFFFFFFFF)
+                        b = self.mem.read_byte((base + j) & 0xFFFFFFFF)
+                        self.mem.write_byte((base + i) & 0xFFFFFFFF, b)
+                        self.mem.write_byte((base + j) & 0xFFFFFFFF, a)
+                        i += 1
+                        j -= 1
         elif opcode == OP_MEMSET:
             # Memory set: R0=dst_addr, R1=value, R2=length
             dst_addr = self.reg_read(0) & 0xFFFFFFFF
             value = self.reg_read(1) & 0xFF
             length = self.reg_read(2) & 0xFFFFFFFF
-            for i in range(length):
-                self.mem.write_byte((dst_addr + i) & 0xFFFFFFFF, value)
+            if length and dst_addr < self.mem.size:
+                max_len = self.mem.size - dst_addr
+                if max_len > 0:
+                    eff_len = length if length <= max_len else max_len
+                    for i in range(eff_len):
+                        self.mem.write_byte((dst_addr + i) & 0xFFFFFFFF, value)
         elif opcode == OP_MEMSCRUB:
             # Secure memory scrub: R0=start_addr, R1=length
             start_addr = self.reg_read(0) & 0xFFFFFFFF
@@ -4670,14 +4681,17 @@ class Assembler:
             return self.eval_expression(tok)
         # Support hex with 0x, trailing h, binary 0b, underscore separators
         tok_clean = tok.replace('_', '')
-        if tok_clean.startswith("0x") or tok_clean.startswith("0X"):
-            return int(tok_clean, 16) & 0xFFFFFFFF
-        if tok_clean.endswith("h") or tok_clean.endswith("H"):
-            return int(tok_clean[:-1], 16) & 0xFFFFFFFF
-        if tok_clean.startswith("0b"):
-            return int(tok_clean, 2) & 0xFFFFFFFF
-        # Decimal or label (label resolution may have returned numeric string)
-        return int(tok_clean, 0) & 0xFFFFFFFF
+        try:
+            if tok_clean.startswith("0x") or tok_clean.startswith("0X"):
+                return int(tok_clean, 16) & 0xFFFFFFFF
+            if tok_clean.endswith("h") or tok_clean.endswith("H"):
+                return int(tok_clean[:-1], 16) & 0xFFFFFFFF
+            if tok_clean.startswith("0b"):
+                return int(tok_clean, 2) & 0xFFFFFFFF
+            # Decimal or label (label resolution may have returned numeric string)
+            return int(tok_clean, 0) & 0xFFFFFFFF
+        except Exception as e:
+            raise AssemblerError(f"Invalid immediate '{tok}': {e}")
     def parse_float(self, tok: str) -> float:
         return float(tok)
     
@@ -5608,7 +5622,8 @@ class CppCompiler:
         known = set([
             'printf','printf_int','get_input','get_string','gettime','swap','reverse',
             'strlen','strcpy','strcat','strncpy','strncat','strstr','strchr','strcmp','memset','lerp','sign',
-            'saturate','pow','rand','srand','popcnt','clz','ctz','rotl','rotr','abs','min','max'
+            'saturate','pow','rand','srand','popcnt','clz','ctz','rotl','rotr','abs','min','max',
+            'mad','avg','absdiff','max3'
         ])
         # Exclude common keywords and entry point
         keywords = set(['if','for','while','switch','return','int','char','float','double','struct','sizeof','main'])
@@ -5975,6 +5990,77 @@ class CppCompiler:
                 lines.extend(self._emit_expression_to_register(node_src, src_reg))
                 lines.extend(self._emit_expression_to_register(node_cnt, cnt_reg))
                 lines.append(f"    STRNCPY {dst_reg}, {src_reg}, {cnt_reg}")
+                self._release_temp_register(cnt_reg)
+                self._release_temp_register(src_reg)
+                self._release_temp_register(dst_reg)
+                return lines, False
+
+            # array_fill(arr, value) as statement form
+            if name == "array_fill" and len(args) == 2:
+                arr_name = args[0].strip()
+                if arr_name not in self.arrays:
+                    raise CppCompilerError("array_fill() first argument must be a declared array")
+                arr_info = self.arrays[arr_name]
+                base_addr = int(arr_info.get("addr", 0))
+                length_elems = int(arr_info.get("size", 0))
+                total_bytes = length_elems * 4
+                if total_bytes <= 0:
+                    return lines, False
+                addr_reg = self._acquire_temp_register()
+                val_reg = self._acquire_temp_register()
+                cnt_reg = self._acquire_temp_register()
+                lines.append(f"    LOADI {addr_reg}, {base_addr}")
+                val_node = self._parse_expression_node(args[1])
+                lines.extend(self._emit_expression_to_register(val_node, val_reg))
+                lines.append(f"    LOADI {cnt_reg}, {total_bytes}")
+                lines.append(f"    MEMSET {addr_reg}, {val_reg}, {cnt_reg}")
+                self._release_temp_register(cnt_reg)
+                self._release_temp_register(val_reg)
+                self._release_temp_register(addr_reg)
+                return lines, False
+
+            # array_zero(arr) as statement shorthand for array_fill(arr, 0)
+            if name == "array_zero" and len(args) == 1:
+                arr_name = args[0].strip()
+                if arr_name not in self.arrays:
+                    raise CppCompilerError("array_zero() requires a declared array")
+                arr_info = self.arrays[arr_name]
+                base_addr = int(arr_info.get("addr", 0))
+                length_elems = int(arr_info.get("size", 0))
+                total_bytes = length_elems * 4
+                if total_bytes <= 0:
+                    return lines, False
+                addr_reg = self._acquire_temp_register()
+                cnt_reg = self._acquire_temp_register()
+                lines.append(f"    LOADI {addr_reg}, {base_addr}")
+                lines.append(f"    LOADI {cnt_reg}, {total_bytes}")
+                lines.append(f"    MEMSET {addr_reg}, R0, {cnt_reg}")  # assumes R0=0 or caller sets
+                self._release_temp_register(cnt_reg)
+                self._release_temp_register(addr_reg)
+                return lines, False
+
+            # array_copy(dst, src) as statement form
+            if name == "array_copy" and len(args) == 2:
+                dst_name = args[0].strip()
+                src_name = args[1].strip()
+                if dst_name not in self.arrays or src_name not in self.arrays:
+                    raise CppCompilerError("array_copy() arguments must be declared arrays")
+                dst_info = self.arrays[dst_name]
+                src_info = self.arrays[src_name]
+                dst_size = int(dst_info.get("size", 0))
+                src_size = int(src_info.get("size", 0))
+                if dst_size != src_size:
+                    raise CppCompilerError("array_copy() requires arrays of the same size")
+                total_bytes = dst_size * 4
+                if total_bytes <= 0:
+                    return lines, False
+                dst_reg = self._acquire_temp_register()
+                src_reg = self._acquire_temp_register()
+                cnt_reg = self._acquire_temp_register()
+                lines.append(f"    LOADI {dst_reg}, {int(dst_info.get('addr', 0))}")
+                lines.append(f"    LOADI {src_reg}, {int(src_info.get('addr', 0))}")
+                lines.append(f"    LOADI {cnt_reg}, {total_bytes}")
+                lines.append(f"    MEMCPY {dst_reg}, {src_reg}, {cnt_reg}")
                 self._release_temp_register(cnt_reg)
                 self._release_temp_register(src_reg)
                 self._release_temp_register(dst_reg)
@@ -7348,6 +7434,81 @@ class CppCompiler:
                 code.append(f"    MIN {target}, {b_reg}")
                 self._release_temp_register(b_reg)
                 return code
+
+            # mad(a, b, c) -> a * b + c
+            if fname == "mad" and len(node.args) == 3:
+                a_reg = self._acquire_temp_register()
+                b_reg = self._acquire_temp_register()
+                c_reg = self._acquire_temp_register()
+                code.extend(self._emit_expression_to_register(node.args[0], a_reg))
+                code.extend(self._emit_expression_to_register(node.args[1], b_reg))
+                code.extend(self._emit_expression_to_register(node.args[2], c_reg))
+                code.append(f"    MOV {target}, {a_reg}")
+                code.append(f"    MUL {target}, {b_reg}")
+                code.append(f"    ADD {target}, {c_reg}")
+                self._release_temp_register(c_reg)
+                self._release_temp_register(b_reg)
+                self._release_temp_register(a_reg)
+                return code
+
+            # avg(a, b) -> (a + b) / 2
+            if fname == "avg" and len(node.args) == 2:
+                a_reg = self._acquire_temp_register()
+                b_reg = self._acquire_temp_register()
+                code.extend(self._emit_expression_to_register(node.args[0], a_reg))
+                code.extend(self._emit_expression_to_register(node.args[1], b_reg))
+                code.append(f"    MOV {target}, {a_reg}")
+                code.append(f"    ADD {target}, {b_reg}")
+                code.append(f"    SHRI {target}, 1")
+                self._release_temp_register(b_reg)
+                self._release_temp_register(a_reg)
+                return code
+
+            # absdiff(a, b) -> |a - b|
+            if fname == "absdiff" and len(node.args) == 2:
+                a_reg = self._acquire_temp_register()
+                b_reg = self._acquire_temp_register()
+                tmp_reg = self._acquire_temp_register()
+                code.extend(self._emit_expression_to_register(node.args[0], a_reg))
+                code.extend(self._emit_expression_to_register(node.args[1], b_reg))
+                code.append(f"    MOV {target}, {a_reg}")
+                code.append(f"    SUB {target}, {b_reg}")
+                code.append(f"    MOV {tmp_reg}, {target}")
+                code.append(f"    ABS {tmp_reg}, {tmp_reg}")
+                code.append(f"    MOV {target}, {tmp_reg}")
+                self._release_temp_register(tmp_reg)
+                self._release_temp_register(b_reg)
+                self._release_temp_register(a_reg)
+                return code
+
+            # max3(a, b, c) -> max(a, max(b, c))
+            if fname == "max3" and len(node.args) == 3:
+                a_reg = self._acquire_temp_register()
+                b_reg = self._acquire_temp_register()
+                c_reg = self._acquire_temp_register()
+                code.extend(self._emit_expression_to_register(node.args[0], a_reg))
+                code.extend(self._emit_expression_to_register(node.args[1], b_reg))
+                code.extend(self._emit_expression_to_register(node.args[2], c_reg))
+                # max of a and b in target
+                code.append(f"    MOV {target}, {a_reg}")
+                code.append(f"    CMP {target}, {b_reg}")
+                lbl_gt = self._new_label("max3_gt")
+                lbl_done = self._new_label("max3_done")
+                code.append(f"    JL {lbl_gt}")
+                code.append(f"    MOV {target}, {b_reg}")
+                code.append(f"{lbl_gt}:")
+                # now compare with c
+                code.append(f"    CMP {target}, {c_reg}")
+                lbl_gt2 = self._new_label("max3_gt2")
+                code.append(f"    JL {lbl_gt2}")
+                code.append(f"    JMP {lbl_done}")
+                code.append(f"{lbl_gt2}:")
+                code.append(f"    MOV {target}, {c_reg}")
+                code.append(f"{lbl_done}:")
+                self._release_temp_register(c_reg)
+                self._release_temp_register(b_reg)
+                self._release_temp_register(a_reg)
+                return code
             if fname == "max" and len(node.args) == 2:
                 # max(a, b) -> maximum of two values
                 code.extend(self._emit_expression_to_register(node.args[0], target))
@@ -7497,6 +7658,117 @@ class CppCompiler:
                 self._release_temp_register(cnt_reg)
                 self._release_temp_register(src_reg)
                 self._release_temp_register(dst_reg)
+                return code
+
+            # memscrub(addr, len) -> securely scrub memory region
+            if fname == "memscrub" and len(node.args) == 2:
+                base_reg = self._acquire_temp_register()
+                cnt_reg = self._acquire_temp_register()
+                code.extend(self._emit_expression_to_register(node.args[0], base_reg))
+                code.extend(self._emit_expression_to_register(node.args[1], cnt_reg))
+                code.append(f"    MOV R0, {base_reg}")
+                code.append(f"    MOV R1, {cnt_reg}")
+                code.append(f"    MEMSCRUB")
+                code.append(f"    LOADI {target}, 0")
+                self._release_temp_register(cnt_reg)
+                self._release_temp_register(base_reg)
+                return code
+
+            # --- Higher-level array helpers ---
+            if fname == "array_len" and len(node.args) == 1:
+                # array_len(arr) -> compile-time array length
+                if isinstance(node.args[0], ast.Name) and node.args[0].id in self.arrays:
+                    arr_info = self.arrays[node.args[0].id]
+                    size = int(arr_info.get("size", 0))
+                    code.append(f"    LOADI {target}, {size}")
+                    return code
+                raise CppCompilerError("array_len() requires an array identifier")
+
+            if fname == "array_fill" and len(node.args) == 2:
+                # array_fill(arr, value) -> fill entire array with value
+                if not isinstance(node.args[0], ast.Name) or node.args[0].id not in self.arrays:
+                    raise CppCompilerError("array_fill() first argument must be a declared array")
+                arr_info = self.arrays[node.args[0].id]
+                base_addr = int(arr_info.get("addr", 0))
+                length_elems = int(arr_info.get("size", 0))
+                total_bytes = length_elems * 4
+                if total_bytes <= 0:
+                    code.append(f"    LOADI {target}, 0")
+                    return code
+                addr_reg = self._acquire_temp_register()
+                val_reg = self._acquire_temp_register()
+                cnt_reg = self._acquire_temp_register()
+                code.append(f"    LOADI {addr_reg}, {base_addr}")
+                code.extend(self._emit_expression_to_register(node.args[1], val_reg))
+                code.append(f"    LOADI {cnt_reg}, {total_bytes}")
+                code.append(f"    MEMSET {addr_reg}, {val_reg}, {cnt_reg}")
+                code.append(f"    LOADI {target}, 0")
+                self._release_temp_register(cnt_reg)
+                self._release_temp_register(val_reg)
+                self._release_temp_register(addr_reg)
+                return code
+
+            if fname == "array_copy" and len(node.args) == 2:
+                # array_copy(dst, src) -> copy entire array (sizes must match)
+                if not (isinstance(node.args[0], ast.Name) and isinstance(node.args[1], ast.Name)):
+                    raise CppCompilerError("array_copy() requires two array identifiers")
+                dst_name = node.args[0].id
+                src_name = node.args[1].id
+                if dst_name not in self.arrays or src_name not in self.arrays:
+                    raise CppCompilerError("array_copy() arguments must be declared arrays")
+                dst_info = self.arrays[dst_name]
+                src_info = self.arrays[src_name]
+                dst_size = int(dst_info.get("size", 0))
+                src_size = int(src_info.get("size", 0))
+                if dst_size != src_size:
+                    raise CppCompilerError("array_copy() requires arrays of the same size")
+                total_bytes = dst_size * 4
+                if total_bytes <= 0:
+                    code.append(f"    LOADI {target}, 0")
+                    return code
+                dst_reg = self._acquire_temp_register()
+                src_reg = self._acquire_temp_register()
+                cnt_reg = self._acquire_temp_register()
+                code.append(f"    LOADI {dst_reg}, {int(dst_info.get('addr', 0))}")
+                code.append(f"    LOADI {src_reg}, {int(src_info.get('addr', 0))}")
+                code.append(f"    LOADI {cnt_reg}, {total_bytes}")
+                code.append(f"    MEMCPY {dst_reg}, {src_reg}, {cnt_reg}")
+                code.append(f"    LOADI {target}, 0")
+                self._release_temp_register(cnt_reg)
+                self._release_temp_register(src_reg)
+                self._release_temp_register(dst_reg)
+                return code
+
+            # --- Struct/class helpers ---
+            if fname == "struct_size" and len(node.args) == 1:
+                # struct_size("Type") -> compile-time class/struct size in bytes
+                if isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str):
+                    cls_name = node.args[0].value
+                    if cls_name not in self.class_definitions:
+                        raise CppCompilerError(f"Unknown class '{cls_name}' in struct_size()")
+                    size = int(self.class_definitions[cls_name].get("size", 0))
+                    code.append(f"    LOADI {target}, {size}")
+                    return code
+                raise CppCompilerError("struct_size() expects a string literal class name")
+
+            if fname == "offsetof" and len(node.args) == 2:
+                # offsetof("Type", "field") -> field offset in bytes
+                if not (isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str)
+                        and isinstance(node.args[1], ast.Constant) and isinstance(node.args[1].value, str)):
+                    raise CppCompilerError("offsetof() expects string literal type and field names")
+                cls_name = node.args[0].value
+                field_name = node.args[1].value
+                if cls_name not in self.class_definitions:
+                    raise CppCompilerError(f"Unknown class '{cls_name}' in offsetof()")
+                members = self.class_definitions[cls_name].get("members", [])
+                offset = None
+                for idx, m in enumerate(members):
+                    if m.get("name") == field_name:
+                        offset = idx * 4  # each member is 4 bytes
+                        break
+                if offset is None:
+                    raise CppCompilerError(f"Field '{field_name}' not found in class '{cls_name}'")
+                code.append(f"    LOADI {target}, {offset}")
                 return code
 
             # memcmp(a, b, n) -> CMPS target, a_reg, b_reg, cnt_reg
