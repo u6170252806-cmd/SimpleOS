@@ -200,7 +200,9 @@ OP_POPCNT = 0x3B
 OP_MIN = 0x3C
 OP_MAX = 0x3D
 OP_ABS = 0x3E
-OP_MEMCPY = 0x3F
+OP_ABSDIFF = 0x3F   # Absolute difference: |dst - src|
+OP_CLAMP01 = 0x40   # Clamp signed value into [0,1]
+OP_MEMCPY = 0x41
 OP_MEMSET = 0x40
 OP_STRLEN = 0x41
 OP_STRCMP = 0x42
@@ -443,6 +445,7 @@ OPCODE_NAME = {
     OP_LEA: "LEA", OP_MOVZX: "MOVZX", OP_MOVSX: "MOVSX",
     OP_MOVB: "MOVB", OP_MOVW: "MOVW", OP_LOADB: "LOADB", OP_STOREB: "STOREB",
     OP_SEXT: "SEXT", OP_ZEXT: "ZEXT", OP_POPCNT: "POPCNT", OP_MIN: "MIN", OP_MAX: "MAX", OP_ABS: "ABS",
+    OP_ABSDIFF: "ABSDIFF", OP_CLAMP01: "CLAMP01",
     OP_MEMCPY: "MEMCPY", OP_MEMSET: "MEMSET", OP_MEMSCRUB: "MEMSCRUB",
     OP_STRLEN: "STRLEN", OP_STRCMP: "STRCMP", OP_CLAMP: "CLAMP",
     OP_ADC: "ADC", OP_SBB: "SBB", OP_CBW: "CBW", OP_CWD: "CWD", OP_CWDQ: "CWDQ",
@@ -3736,6 +3739,24 @@ class CPU:
             result = abs(val) & 0xFFFFFFFF
             self.reg_write(dst, result)
             self.update_zero_and_neg_flags(result)
+        elif opcode == OP_ABSDIFF:
+            # Absolute difference: |dst - src|
+            a = to_signed32(self.reg_read(dst))
+            b = to_signed32(self.reg_read(src))
+            diff = abs(a - b) & 0xFFFFFFFF
+            self.reg_write(dst, diff)
+            self.update_zero_and_neg_flags(diff)
+        elif opcode == OP_CLAMP01:
+            # Clamp signed integer in dst to [0, 1]
+            val = to_signed32(self.reg_read(dst))
+            if val < 0:
+                result = 0
+            elif val > 1:
+                result = 1
+            else:
+                result = val
+            self.reg_write(dst, result & 0xFFFFFFFF)
+            self.update_zero_and_neg_flags(result)
         elif opcode == OP_MEMCPY:
             # Memory copy: R0=dst_addr, R1=src_addr, R2=length
             dst_addr = self.reg_read(0) & 0xFFFFFFFF
@@ -6002,6 +6023,18 @@ class CppCompiler:
                 self._release_temp_register(src_reg)
                 self._release_temp_register(dst_reg)
                 return lines, False
+            # Fallback: treat any other bare function call as an expression,
+            # As a last resort, try to parse as an expression used as a statement
+            try:
+                expr_node = self._parse_expression_node(stmt.rstrip(";"))
+                code = []
+                treg = self._acquire_temp_register()
+                code.extend(self._emit_expression_to_register(expr_node, treg))
+                self._release_temp_register(treg)
+                return code, False
+            except CppCompilerError as e:
+                # Attach statement context to the error for better debugging
+                raise CppCompilerError(f"Error translating call statement '{stmt}': {e}")
 
             # array_fill(arr, value) as statement form
             if name == "array_fill" and len(args) == 2:
@@ -7512,6 +7545,41 @@ class CppCompiler:
                 # rand() -> RANDOM target
                 code.append(f"    RANDOM {target}")
                 return code
+            if fname == "rand_range" and len(node.args) == 2:
+                # rand_range(lo, hi) -> uniform integer in [lo, hi] when hi >= lo
+                # Fallback: if span <= 0, just return lo
+                lo_reg = self._acquire_temp_register()
+                hi_reg = self._acquire_temp_register()
+                span_reg = self._acquire_temp_register()
+                tmp_reg = self._acquire_temp_register()
+                code.extend(self._emit_expression_to_register(node.args[0], lo_reg))
+                code.extend(self._emit_expression_to_register(node.args[1], hi_reg))
+                # span = hi - lo + 1
+                code.append(f"    MOV {span_reg}, {hi_reg}")
+                code.append(f"    SUB {span_reg}, {lo_reg}")
+                code.append(f"    ADD {span_reg}, 1")
+                lbl_bad = self._new_label("rand_range_bad")
+                lbl_ok = self._new_label("rand_range_ok")
+                lbl_done = self._new_label("rand_range_done")
+                # If span <= 0, branch to bad
+                code.append(f"    CMP {span_reg}, 0")
+                code.append(f"    JLE {lbl_bad}")
+                # Good span: RANDOM -> tmp_reg, MOD by span, add lo
+                code.append(f"    RANDOM {tmp_reg}")
+                # Guard against zero span just in case
+                code.extend(self._emit_div_zero_check(span_reg))
+                code.append(f"    MOD {tmp_reg}, {span_reg}")
+                code.append(f"    ADD {tmp_reg}, {lo_reg}")
+                code.append(f"    MOV {target}, {tmp_reg}")
+                code.append(f"    JMP {lbl_done}")
+                code.append(f"{lbl_bad}:")
+                code.append(f"    MOV {target}, {lo_reg}")
+                code.append(f"{lbl_done}:")
+                self._release_temp_register(tmp_reg)
+                self._release_temp_register(span_reg)
+                self._release_temp_register(hi_reg)
+                self._release_temp_register(lo_reg)
+                return code
             if fname == "hash" and len(node.args) == 1:
                 # hash(x) -> HASH target, target
                 code.extend(self._emit_expression_to_register(node.args[0], target))
@@ -7561,6 +7629,112 @@ class CppCompiler:
                 reg_b = self._require_variable(node.args[1].id)
                 code.append(f"    XCHG {reg_a}, {reg_b}")
                 code.append(f"    LOADI {target}, 0")  # Return 0
+                return code
+            if fname == "assert_true" and len(node.args) == 2:
+                # assert_true(cond, code) - if !cond, set R0=code and HALT
+                cond_reg = self._acquire_temp_register()
+                code_reg = self._acquire_temp_register()
+                code.extend(self._emit_expression_to_register(node.args[0], cond_reg))
+                code.extend(self._emit_expression_to_register(node.args[1], code_reg))
+                lbl_ok = self._new_label("assert_true_ok")
+                code.append(f"    CMP {cond_reg}, 0")
+                code.append(f"    JNE {lbl_ok}")
+                code.append(f"    MOV R0, {code_reg}")
+                code.append("    HALT")
+                code.append(f"{lbl_ok}:")
+                code.append(f"    LOADI {target}, 0")
+                self._release_temp_register(code_reg)
+                self._release_temp_register(cond_reg)
+                return code
+            if fname == "assert_eq" and len(node.args) == 3:
+                # assert_eq(a, b, code) - if a != b, set R0=code and HALT
+                a_reg = self._acquire_temp_register()
+                b_reg = self._acquire_temp_register()
+                code_reg = self._acquire_temp_register()
+                code.extend(self._emit_expression_to_register(node.args[0], a_reg))
+                code.extend(self._emit_expression_to_register(node.args[1], b_reg))
+                code.extend(self._emit_expression_to_register(node.args[2], code_reg))
+                lbl_ok2 = self._new_label("assert_eq_ok")
+                code.append(f"    CMP {a_reg}, {b_reg}")
+                code.append(f"    JE {lbl_ok2}")
+                code.append(f"    MOV R0, {code_reg}")
+                code.append("    HALT")
+                code.append(f"{lbl_ok2}:")
+                code.append(f"    LOADI {target}, 0")
+                self._release_temp_register(code_reg)
+                self._release_temp_register(b_reg)
+                self._release_temp_register(a_reg)
+                return code
+            if fname == "wrap" and len(node.args) == 3:
+                # wrap(value, min, max) -> wrap integer into [min, max] range
+                val_reg = self._acquire_temp_register()
+                lo_reg = self._acquire_temp_register()
+                hi_reg = self._acquire_temp_register()
+                code.extend(self._emit_expression_to_register(node.args[0], val_reg))
+                code.extend(self._emit_expression_to_register(node.args[1], lo_reg))
+                code.extend(self._emit_expression_to_register(node.args[2], hi_reg))
+                lbl_low = self._new_label("wrap_low")
+                lbl_high = self._new_label("wrap_high")
+                lbl_done = self._new_label("wrap_done")
+                # if val < lo -> max
+                code.append(f"    CMP {val_reg}, {lo_reg}")
+                code.append(f"    JL {lbl_low}")
+                # if val > hi -> min
+                code.append(f"    CMP {val_reg}, {hi_reg}")
+                code.append(f"    JG {lbl_high}")
+                code.append(f"    MOV {target}, {val_reg}")
+                code.append(f"    JMP {lbl_done}")
+                code.append(f"{lbl_low}:")
+                code.append(f"    MOV {target}, {hi_reg}")
+                code.append(f"    JMP {lbl_done}")
+                code.append(f"{lbl_high}:")
+                code.append(f"    MOV {target}, {lo_reg}")
+                code.append(f"{lbl_done}:")
+                self._release_temp_register(hi_reg)
+                self._release_temp_register(lo_reg)
+                self._release_temp_register(val_reg)
+                return code
+            if fname == "move_towards" and len(node.args) == 3:
+                # move_towards(pos, target_pos, step) -> stepwise move without overshoot
+                pos_reg = self._acquire_temp_register()
+                tgt_reg = self._acquire_temp_register()
+                step_reg = self._acquire_temp_register()
+                code.extend(self._emit_expression_to_register(node.args[0], pos_reg))
+                code.extend(self._emit_expression_to_register(node.args[1], tgt_reg))
+                code.extend(self._emit_expression_to_register(node.args[2], step_reg))
+                lbl_eq = self._new_label("mt_eq")
+                lbl_lt = self._new_label("mt_lt")
+                lbl_gt = self._new_label("mt_gt")
+                lbl_done = self._new_label("mt_done")
+                # if pos == target -> done
+                code.append(f"    CMP {pos_reg}, {tgt_reg}")
+                code.append(f"    JE {lbl_eq}")
+                # if pos < target
+                code.append(f"    JL {lbl_lt}")
+                # else pos > target
+                code.append(f"    JMP {lbl_gt}")
+                code.append(f"{lbl_lt}:")
+                # forward = pos + step; clamp to target
+                code.append(f"    MOV {target}, {pos_reg}")
+                code.append(f"    ADD {target}, {step_reg}")
+                code.append(f"    CMP {target}, {tgt_reg}")
+                code.append(f"    JLE {lbl_done}")
+                code.append(f"    MOV {target}, {tgt_reg}")
+                code.append(f"    JMP {lbl_done}")
+                code.append(f"{lbl_gt}:")
+                # backward = pos - step; clamp to target
+                code.append(f"    MOV {target}, {pos_reg}")
+                code.append(f"    SUB {target}, {step_reg}")
+                code.append(f"    CMP {target}, {tgt_reg}")
+                code.append(f"    JGE {lbl_done}")
+                code.append(f"    MOV {target}, {tgt_reg}")
+                code.append(f"    JMP {lbl_done}")
+                code.append(f"{lbl_eq}:")
+                code.append(f"    MOV {target}, {pos_reg}")
+                code.append(f"{lbl_done}:")
+                self._release_temp_register(step_reg)
+                self._release_temp_register(tgt_reg)
+                self._release_temp_register(pos_reg)
                 return code
             if fname == "reverse" and len(node.args) == 1:
                 # reverse(x) -> REVERSE target, target (reverse bits)
@@ -7675,15 +7849,10 @@ class CppCompiler:
             if fname == "absdiff" and len(node.args) == 2:
                 a_reg = self._acquire_temp_register()
                 b_reg = self._acquire_temp_register()
-                tmp_reg = self._acquire_temp_register()
                 code.extend(self._emit_expression_to_register(node.args[0], a_reg))
                 code.extend(self._emit_expression_to_register(node.args[1], b_reg))
                 code.append(f"    MOV {target}, {a_reg}")
-                code.append(f"    SUB {target}, {b_reg}")
-                code.append(f"    MOV {tmp_reg}, {target}")
-                code.append(f"    ABS {tmp_reg}, {tmp_reg}")
-                code.append(f"    MOV {target}, {tmp_reg}")
-                self._release_temp_register(tmp_reg)
+                code.append(f"    ABSDIFF {target}, {b_reg}")
                 self._release_temp_register(b_reg)
                 self._release_temp_register(a_reg)
                 return code
@@ -7797,6 +7966,11 @@ class CppCompiler:
                 # saturate(x) -> clamp to 0-255 (useful for colors)
                 code.extend(self._emit_expression_to_register(node.args[0], target))
                 code.append(f"    SATURATE {target}")
+                return code
+            if fname == "clamp01" and len(node.args) == 1:
+                # clamp01(x) -> clamp signed integer into [0,1]
+                code.extend(self._emit_expression_to_register(node.args[0], target))
+                code.append(f"    CLAMP01 {target}")
                 return code
             # Math functions
             if fname == "sqrt" and len(node.args) == 1:
